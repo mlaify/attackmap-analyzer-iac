@@ -1,0 +1,28 @@
+version: "3.8"
+
+services:
+  pds:
+    image: ghcr.io/bluesky-social/pds:latest
+    restart: always
+    ports:
+      - "0.0.0.0:80:3000"
+      - "0.0.0.0:443:3443"
+    env_file:
+      - pds.env
+    volumes:
+      - /var/lib/pds:/pds
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+
+  caddy:
+    image: caddy:2
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+
+  watchtower:
+    image: containrrr/watchtower
+    privileged: true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
