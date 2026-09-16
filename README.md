@@ -1,5 +1,10 @@
 # attackmap-analyzer-iac
 
+> [!NOTE]
+> **Development is paused.** This project is not under active development.
+> The code remains available for reference, and security reports are still
+> welcome at [security@mlaify.io](mailto:security@mlaify.io).
+
 Infrastructure-as-Code analyzer plugin for [AttackMap](https://github.com/mlaify/AttackMap).
 
 Covers the class of files that live outside application source but drive the actual runtime posture:
