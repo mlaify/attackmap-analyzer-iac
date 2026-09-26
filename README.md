@@ -26,7 +26,7 @@ Bluesky FINDINGS §2 documented this as the biggest coverage gap: `bluesky-socia
 ```bash
 pip install git+https://github.com/mlaify/attackmap-analyzer-iac.git
 # or as part of the bundle
-pip install "git+https://github.com/mlaify/AttackMap.git#egg=attackmap[all]"
+pip install "attackmap[all] @ git+https://github.com/mlaify/AttackMap.git"
 ```
 
 ## Usage
