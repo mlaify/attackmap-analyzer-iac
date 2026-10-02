@@ -20,6 +20,17 @@ Covers the class of files that live outside application source but drive the act
 
 Emits routes for exposed ports, external calls for third-party actions and `curl` fetches, `SecretHint` for env-template inventory, service-topology hints for compose `services:` — feeding the same pipeline as the source-code analyzers.
 
+### Posture signals
+
+Every signal carries `file`, `line` and `evidence_text`. Signals about something *missing* (no `USER`, no `HEALTHCHECK`, no `permissions:`) point at the final `FROM` line or line 1. The SDK has no weakness/posture signal type yet, so posture items are split by meaning (AttackMap#258):
+
+| Signal list | Hints |
+|---|---|
+| `auth_hints` (privilege / authorization) | `dockerfile_no_user_directive`, `dockerfile_user_root`, `compose_privileged_container`, `shell_sudo_used`, `shell_permissive_chmod`, `gha_pull_request_target_with_checkout`, `gha_no_top_level_permissions` |
+| `entrypoint_hints` (network exposure) | `compose_port_binding_all_interfaces`, `compose_network_mode_host` |
+| `framework_hints` (build, supply-chain and deployment config) | `dockerfile_no_healthcheck`, `dockerfile_run_curl_pipe`, `dockerfile_add_remote`, `dockerfile_base_image_unpinned`, `compose_env_file_reference`, `compose_host_mount:<host path>`, `gha_third_party_action_tag_pinned:<owner/repo>`, `shell_curl_pipe_installer` |
+| `service_hints` | `service_name:<compose service>` |
+
 Bluesky FINDINGS §2 documented this as the biggest coverage gap: `bluesky-social/pds` (a deployment repo) was 95% invisible to AttackMap because every non-JS file was outside the analyzer model. This plugin closes that gap.
 
 ## Install

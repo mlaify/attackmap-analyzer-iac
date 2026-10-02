@@ -61,7 +61,7 @@ def test_dockerfile_missing_user_directive_produces_hint() -> None:
 
 def test_dockerfile_missing_healthcheck_produces_hint() -> None:
     scan = _analyze()
-    hints = {h.hint for h in scan.auth_hints}
+    hints = {h.hint for h in scan.framework_hints}
     assert "dockerfile_no_healthcheck" in hints
 
 
@@ -75,21 +75,21 @@ def test_dockerfile_exposed_ports_become_container_routes() -> None:
 def test_dockerfile_run_curl_pipe_shell_produces_external_and_hint() -> None:
     scan = _analyze()
     targets = {c.target for c in scan.external_calls}
-    hints = {h.hint for h in scan.auth_hints}
+    hints = {h.hint for h in scan.framework_hints}
     assert "dockerfile:curl-pipe-shell" in targets
     assert "dockerfile_run_curl_pipe" in hints
 
 
 def test_dockerfile_add_remote_url_produces_hint() -> None:
     scan = _analyze()
-    hints = {h.hint for h in scan.auth_hints}
+    hints = {h.hint for h in scan.framework_hints}
     assert "dockerfile_add_remote" in hints
 
 
 def test_dockerfile_unpinned_base_image_produces_hint() -> None:
     """`FROM node:18-alpine` isn't SHA-pinned; flag it."""
     scan = _analyze()
-    hints = {h.hint for h in scan.auth_hints}
+    hints = {h.hint for h in scan.framework_hints}
     assert "dockerfile_base_image_unpinned" in hints
 
 
@@ -99,7 +99,7 @@ def test_dockerfile_sha_pinned_base_image_does_not_fire_unpinned_hint(tmp_path: 
         encoding="utf-8",
     )
     scan = IacAnalyzer().analyze(tmp_path)
-    hints = {h.hint for h in scan.auth_hints}
+    hints = {h.hint for h in scan.framework_hints}
     assert "dockerfile_base_image_unpinned" not in hints
 
 
@@ -118,7 +118,7 @@ def test_compose_services_become_service_hints() -> None:
 
 def test_compose_binds_all_interfaces_produces_hint() -> None:
     scan = _analyze()
-    hints = {h.hint for h in scan.auth_hints}
+    hints = {h.hint for h in scan.entrypoint_hints}
     assert "compose_port_binding_all_interfaces" in hints
 
 
@@ -130,7 +130,7 @@ def test_compose_privileged_container_produces_hint() -> None:
 
 def test_compose_env_file_reference_produces_hint() -> None:
     scan = _analyze()
-    envfile_hints = [h for h in scan.auth_hints if h.hint == "compose_env_file_reference"]
+    envfile_hints = [h for h in scan.framework_hints if h.hint == "compose_env_file_reference"]
     assert envfile_hints
     assert "pds.env" in (envfile_hints[0].evidence_text or "")
 
@@ -139,7 +139,7 @@ def test_compose_host_mounted_volumes_produce_hints() -> None:
     scan = _analyze()
     # Hints carry the source path in the `compose_host_mount:<path>` shape
     # so distinct mounts don't dedup together.
-    host_mount_hints = [h for h in scan.auth_hints if h.hint.startswith("compose_host_mount:")]
+    host_mount_hints = [h for h in scan.framework_hints if h.hint.startswith("compose_host_mount:")]
     assert len(host_mount_hints) >= 2
     hints_text = " ".join(h.hint for h in host_mount_hints)
     assert "/var/run/docker.sock" in hints_text
@@ -158,7 +158,7 @@ def test_gha_pull_request_target_with_checkout_produces_hint() -> None:
 
 def test_gha_third_party_action_tag_pinned_produces_hint() -> None:
     scan = _analyze()
-    hints = [h for h in scan.auth_hints if h.hint.startswith("gha_third_party_action_tag_pinned:")]
+    hints = [h for h in scan.framework_hints if h.hint.startswith("gha_third_party_action_tag_pinned:")]
     assert hints
     evidence = " ".join((h.evidence_text or "") + " " + h.hint for h in hints)
     assert "some-third-party/action" in evidence
@@ -168,7 +168,8 @@ def test_gha_first_party_actions_at_tag_do_not_fire_pin_hint() -> None:
     """`actions/checkout@v4` and `github/*@v1` are first-party; broadly
     trusted enough that the tag-vs-SHA rule shouldn't fire on them."""
     scan = _analyze()
-    hints = [h for h in scan.auth_hints if h.hint.startswith("gha_third_party_action_tag_pinned:")]
+    hints = [h for h in scan.framework_hints if h.hint.startswith("gha_third_party_action_tag_pinned:")]
+    assert hints
     for h in hints:
         # Repo name is in the hint after the `:`
         repo = h.hint.split(":", 1)[1]
@@ -220,7 +221,7 @@ def test_env_template_kind_distinguishes_from_env_reference() -> None:
 def test_installer_curl_pipe_shell_produces_external_and_hint() -> None:
     scan = _analyze()
     targets = {c.target for c in scan.external_calls}
-    hints = {h.hint for h in scan.auth_hints}
+    hints = {h.hint for h in scan.framework_hints}
     assert "shell:curl-pipe-shell" in targets
     assert "shell_curl_pipe_installer" in hints
 
@@ -251,7 +252,9 @@ def test_end_to_end_pds_like_scan_surfaces_five_iac_families() -> None:
     # All five signal families should show at least one entry
     assert scan.routes  # container:3000 etc.
     assert scan.external_calls  # curl-pipe
-    assert scan.auth_hints  # dozens of hints across formats
+    assert scan.auth_hints  # privilege posture (root user, sudo, CI token scope)
+    assert scan.framework_hints  # build / supply-chain / deployment-config posture
+    assert scan.entrypoint_hints  # network exposure
     assert scan.secret_hints  # env template + workflow secrets
     assert scan.service_hints  # compose service names
 
@@ -284,5 +287,64 @@ def test_symlinked_file_outside_repo_not_analyzed(tmp_path: Path) -> None:
     (repo / "install.sh").symlink_to(outside / "install.sh")
     result = IacAnalyzer().analyze(repo)
     assert result.files_scanned == 1
-    assert all(h.file == "Dockerfile" for h in result.auth_hints)
+    hints = [*result.auth_hints, *result.framework_hints, *result.entrypoint_hints]
+    assert hints and all(h.file == "Dockerfile" for h in hints)
     assert result.external_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Typed signals + locations (AttackMap#258)
+# ---------------------------------------------------------------------------
+
+
+def test_posture_signals_land_in_typed_lists() -> None:
+    scan = _analyze()
+    auth = {h.hint for h in scan.auth_hints}
+    assert auth == {
+        "dockerfile_no_user_directive",
+        "compose_privileged_container",
+        "shell_sudo_used",
+        "shell_permissive_chmod",
+        "gha_pull_request_target_with_checkout",
+        "gha_no_top_level_permissions",
+    }
+    entrypoints = {h.hint for h in scan.entrypoint_hints}
+    assert entrypoints == {"compose_port_binding_all_interfaces"}
+    framework = {h.hint for h in scan.framework_hints}
+    assert {"dockerfile_no_healthcheck", "dockerfile_run_curl_pipe", "dockerfile_add_remote"} <= framework
+    assert "dockerfile_base_image_unpinned" in framework
+    assert "shell_curl_pipe_installer" in framework
+
+
+def test_compose_network_mode_host_is_an_entrypoint_hint(tmp_path: Path) -> None:
+    (tmp_path / "compose.yaml").write_text(
+        "services:\n  app:\n    image: app@sha256:abc\n    network_mode: host\n", encoding="utf-8"
+    )
+    scan = IacAnalyzer().analyze(tmp_path)
+    hint = next(h for h in scan.entrypoint_hints if h.hint == "compose_network_mode_host")
+    assert (hint.line, hint.evidence_text) == (4, "network_mode: host")
+    assert not any(h.hint == "compose_network_mode_host" for h in scan.auth_hints)
+
+
+def test_dockerfile_user_root_cites_the_user_line(tmp_path: Path) -> None:
+    (tmp_path / "Dockerfile").write_text("FROM alpine:3\n\nUSER root\nHEALTHCHECK CMD true\n", encoding="utf-8")
+    scan = IacAnalyzer().analyze(tmp_path)
+    hint = next(h for h in scan.auth_hints if h.hint == "dockerfile_user_root")
+    assert (hint.line, hint.evidence_text) == (3, "USER root")
+
+
+def test_directive_lines_skip_preceding_blank_lines() -> None:
+    # `^\\s*EXPOSE` in MULTILINE mode also matches the blank line before the
+    # directive; the route must cite the EXPOSE line itself.
+    scan = _analyze()
+    lines = (FIXTURES / "pds_like_repo" / "Dockerfile").read_text().split("\n")
+    route = next(r for r in scan.routes if r.path == "container:3000" and r.file == "Dockerfile")
+    assert lines[route.line - 1].startswith("EXPOSE 3000")
+
+
+def test_compose_service_hints_cite_the_service_key() -> None:
+    scan = _analyze()
+    lines = (FIXTURES / "pds_like_repo" / "compose.yaml").read_text().split("\n")
+    for hint in scan.service_hints:
+        name = hint.hint.removeprefix("service_name:")
+        assert lines[hint.line - 1].strip() == f"{name}:"
