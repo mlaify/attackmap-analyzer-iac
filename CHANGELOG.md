@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Dockerfile / compose misreads (#2)
+
+- **Dockerfile and compose name variants are analyzed.**
+  - Dockerfiles: `Dockerfile.prod`, `Dockerfile-dev`, `api.Dockerfile`, `*.dockerfile` and `Containerfile.*`. BuildKit's `Dockerfile.dockerignore` and `Dockerfile.md`/`.txt`/`.rst` are not.
+  - Compose files: `docker-compose.override.yml`, `docker-compose.prod.yml`, `compose.*.yaml` and `compose-*.yml`. `composer.yml` is not.
+- **USER and HEALTHCHECK are checked on the final build stage.** The Dockerfile is split into stages at each `FROM`. The final stage's effective `USER` and `HEALTHCHECK` come from its own last directive, or are inherited through `FROM <earlier stage>`.
+  - A `USER nobody` in a builder stage no longer hides a final stage that runs as root. That case now gets `dockerfile_no_user_directive`, anchored at the final `FROM`.
+  - `USER root` … `USER app` is no longer reported as root.
+  - A `:nonroot` final base counts as setting a user.
+- **Base-image pinning skips `scratch` and stage aliases, and reports every image.**
+  - `FROM scratch` and `FROM <earlier-stage-alias>` (case-insensitive) are not unpinned images.
+  - `FROM --platform=…` no longer reads the flag as the image.
+  - The hint is now `dockerfile_base_image_unpinned:<image>`, one per unpinned image. Before, only the first per file survived the `(hint, file)` dedup.
+- **Literal secrets in `ENV`/`ARG` and compose `environment:` are flagged** as `SecretHint(kind="hardcoded")`. This applies to secret-shaped names (`*SECRET*`, `*TOKEN*`, `*PASSWORD*`, `*_KEY`, `API_KEY`, …) with a literal value. It covers `ENV A=1 B=2`, legacy `ENV NAME value`, line continuations, `ARG NAME=default`, and the map and list forms of `environment:`. `*_FILE` paths, `${VAR}` references, booleans and `ARG` without a default are not flagged.
+- **Short-syntax ports without a host IP bind all interfaces.** This includes `"5432:5432"`, a bare `"3000"`, and long syntax with `published:` and no `host_ip`. They are flagged like an explicit `0.0.0.0`. Loopback binds (`127.0.0.1:…`, `[::1]:…`) are not.
+  - Ports are read only from `ports:` blocks, so other list items that happen to contain `n:n` no longer count.
+  - The hint is now `compose_port_binding_all_interfaces:<binding>`, one per binding. Core merges hints by `(hint, file)`, so a bare name kept only the first.
+- **Host-root-equivalent compose settings are elevated.** New `AuthHint`s: `compose_docker_socket_mount` (`/var/run/docker.sock` or `/run/docker.sock`; the generic `compose_host_mount:*` framework hint is still emitted too), `compose_cap_add_sys_admin` (`SYS_ADMIN` or `ALL`), `compose_pid_host` and `compose_seccomp_unconfined`. They are privilege posture like `compose_privileged_container`, and `test_signal_conformance.py`'s allow-list is extended with that justification.
+- **Breaking for direct consumers of the hint strings:** `dockerfile_base_image_unpinned` and `compose_port_binding_all_interfaces` now carry a `:<image>` / `:<binding>` suffix, like `compose_host_mount:<path>`. AttackMap core doesn't match on either name.
+
 ### Changed — typed signals instead of overloaded `AuthHint`s (AttackMap#258)
 
 - **`auth_hints` now carries only privilege/authorization posture.** The SDK has no weakness/posture signal type, so the IaC posture checks that used to all be `AuthHint`s are split by meaning, keeping their hint strings (see the README's *Posture signals* table):

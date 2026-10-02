@@ -45,9 +45,18 @@ _SKIP_DIRS = DEFAULT_SKIP_DIRS
 
 # ---- Dockerfile patterns -----------------------------------------------------
 
+# Exact canonical names; `_is_dockerfile` also accepts `Dockerfile.prod`,
+# `Dockerfile-dev`, `api.Dockerfile`, `*.dockerfile` and `Containerfile.*`.
 DOCKERFILE_NAMES = {"Dockerfile", "dockerfile", "Containerfile"}
+# `Dockerfile.dockerignore` is BuildKit's per-Dockerfile ignore file; docs
+# named after a Dockerfile aren't Dockerfiles either.
+_DOCKERFILE_NON_SOURCE_SUFFIXES = (".dockerignore", ".md", ".rst", ".txt")
 
-_DF_FROM = re.compile(r"^\s*FROM\s+(?P<image>[\S]+)(?:\s+AS\s+(?P<alias>\S+))?", re.IGNORECASE | re.MULTILINE)
+# `FROM [--platform=...] <image> [AS <alias>]`
+_DF_FROM = re.compile(
+    r"^\s*FROM\s+(?:--\S+\s+)*(?P<image>[^\s-][\S]*)(?:\s+AS\s+(?P<alias>\S+))?",
+    re.IGNORECASE | re.MULTILINE,
+)
 _DF_USER = re.compile(r"^\s*USER\s+(?P<user>\S+)", re.IGNORECASE | re.MULTILINE)
 _DF_EXPOSE = re.compile(r"^\s*EXPOSE\s+(?P<ports>[0-9\s/tcpud]+)", re.IGNORECASE | re.MULTILINE)
 _DF_HEALTHCHECK = re.compile(r"^\s*HEALTHCHECK\s+", re.IGNORECASE | re.MULTILINE)
@@ -61,7 +70,10 @@ _DF_ADD_REMOTE = re.compile(r"^\s*ADD\s+https?://", re.IGNORECASE | re.MULTILINE
 
 # ---- docker-compose patterns -------------------------------------------------
 
+# Canonical names; `_is_compose_file` also accepts overrides and variants
+# (`docker-compose.override.yml`, `docker-compose.prod.yml`, `compose.dev.yaml`).
 COMPOSE_NAMES = {"docker-compose.yaml", "docker-compose.yml", "compose.yaml", "compose.yml"}
+_COMPOSE_NAME = re.compile(r"^(?:docker-)?compose(?:[.-][^/]+)?\.ya?ml$", re.IGNORECASE)
 
 # service block: `services:\n  <name>:` — we grab each `<name>:` at
 # the second indent level. Cheap; doesn't need a real YAML parser.
@@ -71,11 +83,10 @@ _COMPOSE_SERVICE_NAME = re.compile(
 )
 _COMPOSE_SERVICES_HEADER = re.compile(r"^services:\s*$", re.MULTILINE)
 _COMPOSE_IMAGE = re.compile(r"^\s{2,}image:\s*['\"]?(?P<image>[^\s'\"#]+)", re.MULTILINE)
-_COMPOSE_PORT_BINDING = re.compile(
-    r"['\"]?(?P<host>0\.0\.0\.0|[0-9]+):(?P<container>[0-9]+)(?:/(?:tcp|udp))?['\"]?",
-    re.IGNORECASE,
-)
 _COMPOSE_HOST_MOUNT = re.compile(r"['\"]?(?P<host_path>/[^:\s]*):[^:\s]+['\"]?", re.MULTILINE)
+_COMPOSE_DOCKER_SOCKET = re.compile(r"(?:^|[\s'\"=:])(?P<sock>/(?:var/)?run/docker\.sock)\b", re.MULTILINE)
+_COMPOSE_PID_HOST = re.compile(r"^\s+pid:\s*['\"]?host['\"]?\s*(?:#.*)?$", re.IGNORECASE | re.MULTILINE)
+_COMPOSE_SECCOMP_UNCONFINED = re.compile(r"seccomp[:=]\s*['\"]?unconfined\b", re.IGNORECASE)
 _COMPOSE_PRIVILEGED = re.compile(r"^\s+privileged:\s*true", re.IGNORECASE | re.MULTILINE)
 _COMPOSE_NETWORK_HOST = re.compile(r"^\s+network_mode:\s*['\"]?host['\"]?", re.IGNORECASE | re.MULTILINE)
 # Matches both `env_file: pds.env` (inline) and the list form:
@@ -89,6 +100,16 @@ _COMPOSE_ENV_FILE = re.compile(
     r"^\s+env_file:[ \t]*(?P<inline>[^\s#\n][^\n]*)?\n(?P<listed>(?:\s+-\s+[^\n]+\n)*)",
     re.IGNORECASE | re.MULTILINE,
 )
+
+
+# Secret-shaped variable names (Dockerfile ENV/ARG, compose `environment:`).
+# `*_FILE` variants hold a path to a mounted secret, and `PUBLIC` keys aren't
+# secret.
+_SECRET_NAME = re.compile(
+    r"SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_?KEY|ACCESS_?KEY|API_?KEY|(?:^|_)KEY(?:_|$)",
+    re.IGNORECASE,
+)
+_NON_SECRET_VALUES = {"", "true", "false", "yes", "no", "on", "off", "0", "1", "null", "~"}
 
 
 # ---- GitHub Actions patterns -------------------------------------------------
@@ -164,9 +185,9 @@ class IacAnalyzer:
             if content is None:
                 continue
             result.files_scanned += 1
-            if path.name in DOCKERFILE_NAMES:
+            if _is_dockerfile(path.name):
                 _analyze_dockerfile(content, relative, result)
-            elif path.name in COMPOSE_NAMES:
+            elif _is_compose_file(path.name):
                 _analyze_compose(content, relative, result)
             elif _GHA_PATH.search(relative):
                 _analyze_gha_workflow(content, relative, result)
@@ -178,19 +199,32 @@ class IacAnalyzer:
 
 
 def _iter_candidates(repo: Path):
-    """Files that might be IaC files; ``_is_iac_file`` makes the final call."""
-    return iter_repo_files(
-        repo,
-        names=DOCKERFILE_NAMES | COMPOSE_NAMES | ENV_TEMPLATE_NAMES,
-        suffixes=SHELL_SUFFIXES | {".yml", ".yaml"},
-        skip_dirs=_SKIP_DIRS,
+    """Files that might be IaC files; ``_is_iac_file`` makes the final call.
+
+    Unfiltered: Dockerfile variants (`Dockerfile.prod`) have arbitrary
+    suffixes, so they can't be selected by name or suffix up front.
+    """
+    return iter_repo_files(repo, skip_dirs=_SKIP_DIRS)
+
+
+def _is_dockerfile(name: str) -> bool:
+    lower = name.lower()
+    if lower.endswith(_DOCKERFILE_NON_SOURCE_SUFFIXES):
+        return False
+    return (
+        lower.startswith(("dockerfile", "containerfile"))
+        or lower.endswith((".dockerfile", ".containerfile"))
     )
 
 
+def _is_compose_file(name: str) -> bool:
+    return name in COMPOSE_NAMES or bool(_COMPOSE_NAME.match(name))
+
+
 def _is_iac_file(path: Path, relative: str) -> bool:
-    if path.name in DOCKERFILE_NAMES:
+    if _is_dockerfile(path.name):
         return True
-    if path.name in COMPOSE_NAMES:
+    if _is_compose_file(path.name):
         return True
     if _GHA_PATH.search(relative):
         return True
@@ -204,26 +238,85 @@ def _is_iac_file(path: Path, relative: str) -> bool:
 # ---- File-specific extractors ------------------------------------------------
 
 
-def _analyze_dockerfile(content: str, relative: str, result: ScanResult) -> None:
-    # Absence signals apply to the final build stage: anchor them at the last FROM.
-    from_matches = list(_DF_FROM.finditer(content))
-    final_stage = _at(from_matches[-1]) if from_matches else None
+def _dockerfile_stages(content: str, from_matches: list[re.Match]) -> list[dict]:
+    """Split a Dockerfile at each FROM into stages.
 
-    # USER directive absence is a signal: containers default to root.
-    if not _DF_USER.search(content):
-        _append_hint(
-            result.auth_hints, AuthHint, "dockerfile_no_user_directive", relative, content, final_stage,
-            evidence="no USER directive: the container runs as root", confidence=0.6,
+    Each stage records its base image, alias, the offset of its FROM, its
+    body text (up to the next FROM) and that body's offset in ``content``.
+    """
+    stages = []
+    for index, match in enumerate(from_matches):
+        body_end = from_matches[index + 1].start() if index + 1 < len(from_matches) else len(content)
+        stages.append(
+            {
+                "image": match.group("image"),
+                "alias": (match.group("alias") or "").lower() or None,
+                "offset": _at(match),
+                "body": content[match.end():body_end],
+                "body_offset": match.end(),
+            }
         )
+    return stages
+
+
+def _effective_stage_directive(stages: list[dict], index: int, pattern: re.Pattern) -> tuple[re.Match, int] | None:
+    """Last ``pattern`` match that applies to stage ``index``.
+
+    A stage built `FROM <earlier-stage-alias>` inherits that stage's USER and
+    HEALTHCHECK, so walk back through aliases. Returns (match, body_offset).
+    """
+    seen: set[int] = set()
+    while index not in seen:
+        seen.add(index)
+        stage = stages[index]
+        matches = list(pattern.finditer(stage["body"]))
+        if matches:
+            return matches[-1], stage["body_offset"]
+        image = stage["image"].lower()
+        parent = next(
+            (i for i in range(index - 1, -1, -1) if stages[i]["alias"] == image),
+            None,
+        )
+        if parent is None:
+            return None
+        index = parent
+    return None
+
+
+def _analyze_dockerfile(content: str, relative: str, result: ScanResult) -> None:
+    from_matches = list(_DF_FROM.finditer(content))
+    stages = _dockerfile_stages(content, from_matches)
+    # Absence signals apply to the final build stage: anchor them at its FROM.
+    final_stage = stages[-1]["offset"] if stages else None
+
+    # USER: only the final stage's effective user matters. A `USER nobody`
+    # in a builder stage says nothing about the image that ships.
+    if stages:
+        effective_user = _effective_stage_directive(stages, len(stages) - 1, _DF_USER)
     else:
-        # If USER is present but set to root explicitly, flag it.
-        for match in _DF_USER.finditer(content):
-            user = match.group("user").strip("'\"")
-            if user.lower() in {"root", "0"}:
-                _append_hint(
-                    result.auth_hints, AuthHint, "dockerfile_user_root", relative, content, _at(match),
-                    confidence=0.9,
-                )
+        user_matches = list(_DF_USER.finditer(content))
+        effective_user = (user_matches[-1], 0) if user_matches else None
+    final_image = stages[-1]["image"].lower() if stages else ""
+    if effective_user is None:
+        # A `:nonroot` / `:nonroot-…` distroless-style base sets its own user.
+        if not re.search(r":nonroot\b", final_image):
+            _append_hint(
+                result.auth_hints, AuthHint, "dockerfile_no_user_directive", relative, content, final_stage,
+                evidence=(
+                    "no USER directive in the final stage: the container runs as root"
+                    if len(stages) > 1
+                    else "no USER directive: the container runs as root"
+                ),
+                confidence=0.6,
+            )
+    else:
+        match, base = effective_user
+        user = match.group("user").strip("'\"").split(":", 1)[0]
+        if user.lower() in {"root", "0"}:
+            _append_hint(
+                result.auth_hints, AuthHint, "dockerfile_user_root", relative, content, base + _at(match),
+                confidence=0.9,
+            )
 
     # EXPOSE — each exposed port is a route-like entry point.
     for match in _DF_EXPOSE.finditer(content):
@@ -231,8 +324,13 @@ def _analyze_dockerfile(content: str, relative: str, result: ScanResult) -> None
         for port in ports:
             _append_route(result, f"container:{port}", "EXPOSE", relative, line=line_of(content, _at(match)))
 
-    # HEALTHCHECK absence signals thin operational monitoring.
-    if not _DF_HEALTHCHECK.search(content):
+    # HEALTHCHECK absence signals thin operational monitoring (final stage).
+    has_healthcheck = (
+        _effective_stage_directive(stages, len(stages) - 1, _DF_HEALTHCHECK) is not None
+        if stages
+        else bool(_DF_HEALTHCHECK.search(content))
+    )
+    if not has_healthcheck:
         _append_hint(
             result.framework_hints, FrameworkHint, "dockerfile_no_healthcheck", relative, content, final_stage,
             evidence="no HEALTHCHECK directive", confidence=0.6,
@@ -253,14 +351,64 @@ def _analyze_dockerfile(content: str, relative: str, result: ScanResult) -> None
             confidence=0.9,
         )
 
-    # FROM image tag vs SHA pinning.
-    for match in from_matches:
-        image = match.group("image")
-        if "@sha256:" not in image:
+    # FROM image tag vs SHA pinning. `scratch` is not an image and
+    # `FROM <earlier-stage-alias>` refers to a stage in this file. One hint
+    # per image: the image is part of the hint so they don't dedup together.
+    aliases: set[str] = set()
+    for stage in stages:
+        image = stage["image"]
+        if image.lower() != "scratch" and image.lower() not in aliases and "@sha256:" not in image:
             _append_hint(
-                result.framework_hints, FrameworkHint, "dockerfile_base_image_unpinned", relative, content,
-                _at(match), evidence=image, confidence=0.8,
+                result.framework_hints, FrameworkHint, f"dockerfile_base_image_unpinned:{image}", relative, content,
+                stage["offset"], evidence=image, confidence=0.8,
             )
+        if stage["alias"]:
+            aliases.add(stage["alias"])
+
+    # ENV / ARG with a secret-shaped name and a literal value is baked into
+    # the image config / build history.
+    for name, value, offset in _dockerfile_env_assignments(content):
+        if _is_literal_secret(name, value):
+            _append_secret(result, name=name, file=relative, content=content, offset=offset, kind="hardcoded")
+
+
+_DF_ENV_ARG = re.compile(r"^[ \t]*(?P<kw>ENV|ARG)[ \t]+(?P<rest>(?:[^\n]*\\\n)*[^\n]*)", re.IGNORECASE | re.MULTILINE)
+_DF_KV = re.compile(r"""(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>"(?:[^"\\]|\\.)*"|'[^']*'|\S*)""")
+
+
+def _dockerfile_env_assignments(content: str):
+    """Yield (name, value, offset) for each ENV/ARG assignment.
+
+    Handles `ENV A=1 B=2`, the legacy `ENV NAME value` form, `ARG NAME=default`
+    and backslash line continuations. `ARG NAME` without a default yields
+    nothing.
+    """
+    for match in _DF_ENV_ARG.finditer(content):
+        rest = match.group("rest")
+        rest_offset = match.start("rest")
+        parts = rest.strip().split(None, 1)
+        if not parts:
+            continue
+        if "=" not in parts[0]:
+            # Legacy `ENV NAME value` (ARG always uses `=` for a default).
+            if match.group("kw").upper() == "ENV" and len(parts) == 2:
+                yield parts[0], parts[1].strip(), rest_offset + rest.find(parts[0])
+            continue
+        for kv in _DF_KV.finditer(rest):
+            yield kv.group("key"), kv.group("value"), rest_offset + kv.start()
+
+
+def _is_literal_secret(name: str, value: str) -> bool:
+    if not _SECRET_NAME.search(name):
+        return False
+    upper = name.upper()
+    if upper.endswith("_FILE") or "PUBLIC" in upper:
+        return False
+    value = value.strip().strip("'\"").strip()
+    if value.lower() in _NON_SECRET_VALUES:
+        return False
+    # `${VAR}` / `$VAR` is a reference resolved at build or run time.
+    return not value.startswith("$")
 
 
 def _analyze_compose(content: str, relative: str, result: ScanResult) -> None:
@@ -281,24 +429,51 @@ def _analyze_compose(content: str, relative: str, result: ScanResult) -> None:
                 services_start.end() + match.start(), confidence=0.9,
             )
 
-    # Port bindings.
-    for line_match in re.finditer(r"^\s*-\s*(?P<binding>[^#\n]+)", content, re.MULTILINE):
-        binding = line_match.group("binding").strip()
-        port_match = _COMPOSE_PORT_BINDING.search(binding)
-        if port_match:
-            host, container = port_match.group("host"), port_match.group("container")
-            if host == "0.0.0.0":
-                _append_hint(
-                    result.entrypoint_hints, EntrypointHint, "compose_port_binding_all_interfaces", relative,
-                    content, _at(line_match), evidence=binding, confidence=0.9,
-                )
-            _append_route(
-                result,
-                f"container:{container}",
-                "EXPOSE",
-                relative,
-                line=line_of(content, _at(line_match)),
+    # Port bindings, read from `ports:` blocks only. Short syntax without a
+    # host IP (`"5432:5432"`, or a bare `"3000"`) publishes on every
+    # interface, exactly like an explicit `0.0.0.0`. One hint per binding:
+    # the binding is part of the hint, since core merges hints by (hint, file).
+    for binding, offset in _compose_port_bindings(content):
+        host_ip, container = _parse_port_binding(binding)
+        if container is None:
+            continue
+        if host_ip in {"", "0.0.0.0", "::"}:
+            _append_hint(
+                result.entrypoint_hints, EntrypointHint, f"compose_port_binding_all_interfaces:{binding}", relative,
+                content, offset, evidence=binding, confidence=0.9,
             )
+        _append_route(result, f"container:{container}", "EXPOSE", relative, line=line_of(content, offset))
+
+    # Literal secrets in `environment:` (map or list form).
+    for name, value, offset in _compose_environment(content):
+        if _is_literal_secret(name, value):
+            _append_secret(result, name=name, file=relative, content=content, offset=offset, kind="hardcoded")
+
+    # Host-root-equivalent settings: Docker socket mounts, SYS_ADMIN/ALL
+    # capabilities, the host PID namespace, seccomp disabled.
+    sock = _COMPOSE_DOCKER_SOCKET.search(content)
+    if sock:
+        _append_hint(
+            result.auth_hints, AuthHint, "compose_docker_socket_mount", relative, content, sock.start("sock"),
+            confidence=0.95,
+        )
+    for cap, offset in _compose_cap_add(content):
+        if cap.upper().removeprefix("CAP_") in {"SYS_ADMIN", "ALL"}:
+            _append_hint(
+                result.auth_hints, AuthHint, "compose_cap_add_sys_admin", relative, content, offset,
+                confidence=0.9,
+            )
+    pid_host = _COMPOSE_PID_HOST.search(content)
+    if pid_host:
+        _append_hint(
+            result.auth_hints, AuthHint, "compose_pid_host", relative, content, _at(pid_host), confidence=0.9,
+        )
+    seccomp = _COMPOSE_SECCOMP_UNCONFINED.search(content)
+    if seccomp:
+        _append_hint(
+            result.auth_hints, AuthHint, "compose_seccomp_unconfined", relative, content, seccomp.start(),
+            confidence=0.9,
+        )
 
     privileged = _COMPOSE_PRIVILEGED.search(content)
     if privileged:
@@ -341,6 +516,104 @@ def _analyze_compose(content: str, relative: str, result: ScanResult) -> None:
             result.framework_hints, FrameworkHint, f"compose_host_mount:{mount.split(':')[0]}", relative, content,
             _at(line_match), evidence=mount, confidence=0.9,
         )
+
+
+def _yaml_block(content: str, key: str):
+    """Yield (key_match, block_text, block_offset) for each `key:` mapping.
+
+    The block is every following line indented deeper than the key (blank
+    and comment lines included). Inline values (`key: [..]`) give an empty
+    block; the caller reads them from ``key_match``.
+    """
+    pattern = re.compile(rf"^(?P<indent>[ \t]*){re.escape(key)}:[ \t]*(?P<inline>[^\n#]*)", re.MULTILINE)
+    for match in pattern.finditer(content):
+        indent = len(match.group("indent"))
+        pos = match.end()
+        newline = content.find("\n", pos)
+        start = len(content) if newline == -1 else newline + 1
+        end = start
+        while end < len(content):
+            line_end = content.find("\n", end)
+            line_end = len(content) if line_end == -1 else line_end
+            line = content[end:line_end]
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#") and len(line) - len(line.lstrip()) <= indent:
+                break
+            end = line_end + 1
+        yield match, content[start:min(end, len(content))], start
+
+
+def _compose_port_bindings(content: str):
+    """Yield (binding, offset) for each published port in `ports:` blocks."""
+    for key, block, base in _yaml_block(content, "ports"):
+        inline = key.group("inline").strip()
+        if inline.startswith("["):
+            for item in re.finditer(r"[^,\[\]\s][^,\[\]]*", inline):
+                yield item.group().strip().strip("'\""), key.start("inline") + item.start()
+            continue
+        # Long syntax: `- target: 80` / `published: 8080` / `host_ip: ...`.
+        for item in re.finditer(r"^[ \t]*-[ \t]*(?P<entry>[^\n]*(?:\n(?![ \t]*-)[^\n]*)*)", block, re.MULTILINE):
+            entry = item.group("entry")
+            offset = base + item.start("entry")
+            if re.match(r"(?:target|published|host_ip|protocol|mode)\s*:", entry.strip()):
+                fields = dict(re.findall(r"(target|published|host_ip)\s*:\s*['\"]?([^'\"\s#]+)", entry))
+                if "published" not in fields:
+                    continue  # not published on the host
+                host_ip = fields.get("host_ip", "")
+                prefix = f"{host_ip}:" if host_ip else ""
+                yield f"{prefix}{fields['published']}:{fields.get('target', '')}", offset
+                continue
+            value = entry.split("#", 1)[0].strip().strip("'\"")
+            if value:
+                yield value, offset
+
+
+def _parse_port_binding(binding: str) -> tuple[str, str | None]:
+    """Split a short-syntax binding into (host_ip, container_port).
+
+    `"5432:5432"` / `"3000"` → ("", ...): no IP means every interface.
+    `"127.0.0.1:5432:5432"` → ("127.0.0.1", "5432"); `"[::1]:80:80"` → ("::1", "80").
+    """
+    value = binding.strip().strip("'\"").split("/", 1)[0]
+    host_ip = ""
+    if value.startswith("["):
+        close = value.find("]")
+        host_ip, value = value[1:close], value[close + 2:]
+        parts = value.split(":")
+    else:
+        parts = value.split(":")
+        if len(parts) >= 3:
+            host_ip, parts = ":".join(parts[:-2]), parts[-2:]
+    container = parts[-1] if parts and re.fullmatch(r"[0-9]+(?:-[0-9]+)?", parts[-1] or "") else None
+    if host_ip.lower() == "localhost" or host_ip.startswith("127.") or host_ip == "::1":
+        host_ip = "loopback"
+    return host_ip, container
+
+
+def _compose_environment(content: str):
+    """Yield (name, value, offset) from `environment:` blocks (map or list)."""
+    for _key, block, base in _yaml_block(content, "environment"):
+        for item in re.finditer(
+            r"^[ \t]*(?:-[ \t]*['\"]?(?P<lname>[A-Za-z_][A-Za-z0-9_]*)=(?P<lvalue>[^\n]*?)['\"]?[ \t]*$"
+            r"|(?P<mname>[A-Za-z_][A-Za-z0-9_]*):[ \t]*(?P<mvalue>[^\n#]*))",
+            block,
+            re.MULTILINE,
+        ):
+            name = item.group("lname") or item.group("mname")
+            value = item.group("lvalue") if item.group("lname") else item.group("mvalue")
+            yield name, (value or "").strip(), base + item.start("lname" if item.group("lname") else "mname")
+
+
+def _compose_cap_add(content: str):
+    """Yield (capability, offset) from `cap_add:` (inline or list form)."""
+    for key, block, base in _yaml_block(content, "cap_add"):
+        inline = key.group("inline").strip()
+        if inline.startswith("["):
+            for cap in re.finditer(r"[A-Za-z_]+", inline):
+                yield cap.group(), key.start("inline") + cap.start()
+            continue
+        for item in re.finditer(r"^[ \t]*-[ \t]*['\"]?(?P<cap>[A-Za-z_]+)", block, re.MULTILINE):
+            yield item.group("cap"), base + item.start("cap")
 
 
 def _analyze_gha_workflow(content: str, relative: str, result: ScanResult) -> None:
