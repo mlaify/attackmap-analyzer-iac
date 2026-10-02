@@ -90,7 +90,8 @@ def test_dockerfile_unpinned_base_image_produces_hint() -> None:
     """`FROM node:18-alpine` isn't SHA-pinned; flag it."""
     scan = _analyze()
     hints = {h.hint for h in scan.framework_hints}
-    assert "dockerfile_base_image_unpinned" in hints
+    # The image is part of the hint (#2) so each unpinned FROM is reported.
+    assert "dockerfile_base_image_unpinned:node:18-alpine" in hints
 
 
 def test_dockerfile_sha_pinned_base_image_does_not_fire_unpinned_hint(tmp_path: Path) -> None:
@@ -119,7 +120,9 @@ def test_compose_services_become_service_hints() -> None:
 def test_compose_binds_all_interfaces_produces_hint() -> None:
     scan = _analyze()
     hints = {h.hint for h in scan.entrypoint_hints}
-    assert "compose_port_binding_all_interfaces" in hints
+    # The binding is part of the hint (#2): one per published port.
+    assert "compose_port_binding_all_interfaces:0.0.0.0:80:3000" in hints
+    assert "compose_port_binding_all_interfaces:80:80" in hints  # caddy: no IP = all interfaces
 
 
 def test_compose_privileged_container_produces_hint() -> None:
@@ -303,16 +306,22 @@ def test_posture_signals_land_in_typed_lists() -> None:
     assert auth == {
         "dockerfile_no_user_directive",
         "compose_privileged_container",
+        "compose_docker_socket_mount",  # watchtower mounts /var/run/docker.sock (#2)
         "shell_sudo_used",
         "shell_permissive_chmod",
         "gha_pull_request_target_with_checkout",
         "gha_no_top_level_permissions",
     }
     entrypoints = {h.hint for h in scan.entrypoint_hints}
-    assert entrypoints == {"compose_port_binding_all_interfaces"}
+    assert entrypoints == {
+        "compose_port_binding_all_interfaces:0.0.0.0:80:3000",
+        "compose_port_binding_all_interfaces:0.0.0.0:443:3443",
+        "compose_port_binding_all_interfaces:80:80",
+        "compose_port_binding_all_interfaces:443:443",
+    }
     framework = {h.hint for h in scan.framework_hints}
     assert {"dockerfile_no_healthcheck", "dockerfile_run_curl_pipe", "dockerfile_add_remote"} <= framework
-    assert "dockerfile_base_image_unpinned" in framework
+    assert "dockerfile_base_image_unpinned:node:18-alpine" in framework
     assert "shell_curl_pipe_installer" in framework
 
 
@@ -348,3 +357,140 @@ def test_compose_service_hints_cite_the_service_key() -> None:
     for hint in scan.service_hints:
         name = hint.hint.removeprefix("service_name:")
         assert lines[hint.line - 1].strip() == f"{name}:"
+
+
+# ---------------------------------------------------------------------------
+# Dockerfile / compose misreads (#2)
+# ---------------------------------------------------------------------------
+
+MULTISTAGE = "docker_multistage_repo"
+
+
+def test_final_stage_without_user_is_root_even_if_builder_sets_user() -> None:
+    scan = _analyze(MULTISTAGE)
+    hints = {(h.hint, h.file) for h in scan.auth_hints}
+    assert ("dockerfile_no_user_directive", "Dockerfile") in hints
+    hint = next(h for h in scan.auth_hints if (h.hint, h.file) == ("dockerfile_no_user_directive", "Dockerfile"))
+    lines = (FIXTURES / MULTISTAGE / "Dockerfile").read_text().split("\n")
+    assert lines[hint.line - 1] == "FROM scratch"  # anchored at the final stage
+
+
+def test_final_stage_inherits_user_from_its_parent_stage(tmp_path: Path) -> None:
+    (tmp_path / "Dockerfile").write_text(
+        "FROM alpine:3 AS base\nUSER app\nHEALTHCHECK CMD true\n\nFROM base\nCMD [\"run\"]\n", encoding="utf-8"
+    )
+    scan = IacAnalyzer().analyze(tmp_path)
+    assert not {"dockerfile_no_user_directive", "dockerfile_user_root"} & {h.hint for h in scan.auth_hints}
+    assert "dockerfile_no_healthcheck" not in {h.hint for h in scan.framework_hints}
+
+
+def test_switching_back_from_root_in_final_stage_is_not_root(tmp_path: Path) -> None:
+    (tmp_path / "Dockerfile").write_text(
+        "FROM alpine:3\nUSER root\nRUN apk add curl\nUSER 10001:10001\n", encoding="utf-8"
+    )
+    scan = IacAnalyzer().analyze(tmp_path)
+    assert "dockerfile_user_root" not in {h.hint for h in scan.auth_hints}
+
+
+@pytest.mark.parametrize(
+    "dockerfile",
+    [
+        "FROM golang:1@sha256:{sha} AS build\nFROM scratch\n",
+        "FROM node:20@sha256:{sha} AS deps\nFROM deps\n",
+        "FROM node:20@sha256:{sha} AS Deps\nFROM deps\n",  # aliases are case-insensitive
+        "FROM --platform=$BUILDPLATFORM golang:1@sha256:{sha}\n",  # flag, not the image
+    ],
+)
+def test_scratch_stage_aliases_and_flags_are_not_unpinned_images(tmp_path: Path, dockerfile: str) -> None:
+    (tmp_path / "Dockerfile").write_text(dockerfile.format(sha="0" * 64), encoding="utf-8")
+    scan = IacAnalyzer().analyze(tmp_path)
+    unpinned = [h for h in scan.framework_hints if h.hint.startswith("dockerfile_base_image_unpinned")]
+    assert unpinned == []
+
+
+def test_each_unpinned_from_image_is_reported_separately() -> None:
+    scan = _analyze(MULTISTAGE)
+    unpinned = {
+        h.hint for h in scan.framework_hints
+        if h.file == "api.Dockerfile" and h.hint.startswith("dockerfile_base_image_unpinned")
+    }
+    assert unpinned == {
+        "dockerfile_base_image_unpinned:node:20",
+        "dockerfile_base_image_unpinned:python:3.12-slim",
+    }
+
+
+def test_env_and_arg_literal_secrets_are_hardcoded_secret_hints() -> None:
+    scan = _analyze(MULTISTAGE)
+    secrets = {(s.name, s.file, s.kind) for s in scan.secret_hints}
+    assert ("AWS_SECRET_ACCESS_KEY", "Dockerfile", "hardcoded") in secrets
+    assert ("NPM_TOKEN", "api.Dockerfile", "hardcoded") in secrets  # ARG default
+    names = {s.name for s in scan.secret_hints}
+    # A `_FILE` path, an ARG without a default and plain settings aren't secrets.
+    assert not {"DB_PASSWORD_FILE", "BUILD_TOKEN", "LOG_LEVEL"} & names
+    for secret in scan.secret_hints:
+        assert "fixture-" not in (secret.evidence_text or "")  # core redacts the literal
+
+
+def test_dockerfile_variants_and_compose_overrides_are_analyzed() -> None:
+    scan = _analyze(MULTISTAGE)
+    files = {h.file for h in [*scan.auth_hints, *scan.entrypoint_hints, *scan.framework_hints, *scan.secret_hints]}
+    assert {"Dockerfile.prod", "api.Dockerfile", "docker-compose.override.yml"} <= files
+    assert "Dockerfile.dockerignore" not in files
+    assert scan.files_scanned == 5  # Dockerfile, Dockerfile.prod, api.Dockerfile, 2 compose files
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["Dockerfile.prod", "Dockerfile-dev", "api.Dockerfile", "web.dockerfile", "Containerfile.ci"],
+)
+def test_dockerfile_name_variants_are_detected(tmp_path: Path, name: str) -> None:
+    (tmp_path / name).write_text("FROM alpine:3\n", encoding="utf-8")
+    assert IacAnalyzer().detect(tmp_path) is True
+
+
+@pytest.mark.parametrize(
+    "name", ["docker-compose.override.yml", "docker-compose.prod.yaml", "compose.dev.yaml", "compose-ci.yml"]
+)
+def test_compose_name_variants_are_analyzed(tmp_path: Path, name: str) -> None:
+    (tmp_path / name).write_text("services:\n  app:\n    privileged: true\n", encoding="utf-8")
+    scan = IacAnalyzer().analyze(tmp_path)
+    assert ("compose_privileged_container", name) in {(h.hint, h.file) for h in scan.auth_hints}
+
+
+def test_composer_yml_is_not_a_compose_file(tmp_path: Path) -> None:
+    (tmp_path / "composer.yml").write_text("services:\n  app:\n    privileged: true\n", encoding="utf-8")
+    assert IacAnalyzer().detect(tmp_path) is False
+
+
+def test_short_syntax_ports_without_ip_bind_all_interfaces() -> None:
+    scan = _analyze(MULTISTAGE)
+    bindings = {
+        (h.file, h.evidence_text)
+        for h in scan.entrypoint_hints
+        if h.hint == f"compose_port_binding_all_interfaces:{h.evidence_text}"
+    }
+    assert ("compose.yaml", "5432:5432") in bindings
+    assert ("docker-compose.override.yml", "8080:80") in bindings  # long syntax, no host_ip
+    assert ("docker-compose.override.yml", "3000") in bindings  # ephemeral host port
+    assert not any("6543" in evidence for _file, evidence in bindings)  # 127.0.0.1 only
+
+
+def test_compose_environment_literal_secrets_are_flagged() -> None:
+    scan = _analyze(MULTISTAGE)
+    secrets = {(s.name, s.file, s.kind) for s in scan.secret_hints}
+    assert ("POSTGRES_PASSWORD", "compose.yaml", "hardcoded") in secrets  # map form
+    assert ("API_TOKEN", "docker-compose.override.yml", "hardcoded") in secrets  # list form
+    names = {s.name for s in scan.secret_hints}
+    assert not {"POSTGRES_USER", "POSTGRES_PASSWORD_FILE", "REPLICATION_TOKEN", "DEBUG"} & names
+
+
+def test_host_root_equivalent_compose_settings_are_elevated() -> None:
+    scan = _analyze(MULTISTAGE)
+    auth = {h.hint for h in scan.auth_hints if h.file == "compose.yaml"}
+    assert {
+        "compose_docker_socket_mount",
+        "compose_cap_add_sys_admin",
+        "compose_pid_host",
+        "compose_seccomp_unconfined",
+    } <= auth

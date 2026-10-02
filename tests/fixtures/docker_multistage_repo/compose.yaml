@@ -1,0 +1,20 @@
+services:
+  db:
+    image: postgres:16
+    ports:
+      - "5432:5432"
+      - "127.0.0.1:6543:6543"
+    environment:
+      POSTGRES_PASSWORD: example
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg
+      REPLICATION_TOKEN: ${REPLICATION_TOKEN}
+
+  agent:
+    image: portainer/agent:2.19
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    cap_add: [SYS_ADMIN]
+    pid: host
+    security_opt:
+      - seccomp:unconfined

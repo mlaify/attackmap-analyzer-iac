@@ -1,0 +1,10 @@
+services:
+  web:
+    image: nginx:1.27
+    ports:
+      - target: 80
+        published: 8080
+      - "3000"
+    environment:
+      - API_TOKEN=fixture-api-token
+      - DEBUG=true
