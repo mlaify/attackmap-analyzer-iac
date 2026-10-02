@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import shutil
+import sys
 from pathlib import Path
+
+import pytest
 
 from attackmap.sdk.contracts import AnalyzerMetadata as SharedAnalyzerMetadata
 from attackmap.sdk.models import ScanResult as SharedScanResult
@@ -250,3 +254,35 @@ def test_end_to_end_pds_like_scan_surfaces_five_iac_families() -> None:
     assert scan.auth_hints  # dozens of hints across formats
     assert scan.secret_hints  # env template + workflow secrets
     assert scan.service_hints  # compose service names
+
+
+# ---------------------------------------------------------------------------
+# Repo walking (mlaify/AttackMap#253)
+# ---------------------------------------------------------------------------
+
+
+def test_repo_under_skip_dir_named_parents_is_analyzed(tmp_path: Path) -> None:
+    """A checkout under /.../build/out/... must not be skipped (absolute-path bug)."""
+    repo = tmp_path / "build" / "out" / "repo"
+    shutil.copytree(FIXTURES / "pds_like_repo", repo)
+    analyzer = IacAnalyzer()
+    assert analyzer.detect(repo) is True
+    result = analyzer.analyze(repo)
+    assert result.files_scanned == _analyze().files_scanned
+    assert result.auth_hints
+    assert any(h.file == ".github/workflows/build-and-push-ghcr.yaml" for h in result.auth_hints)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+def test_symlinked_file_outside_repo_not_analyzed(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "install.sh").write_text("curl -fsSL https://example.com/x | bash\n", encoding="utf-8")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "Dockerfile").write_text("FROM alpine@sha256:" + "a" * 64 + "\nUSER app\n", encoding="utf-8")
+    (repo / "install.sh").symlink_to(outside / "install.sh")
+    result = IacAnalyzer().analyze(repo)
+    assert result.files_scanned == 1
+    assert all(h.file == "Dockerfile" for h in result.auth_hints)
+    assert result.external_calls == []

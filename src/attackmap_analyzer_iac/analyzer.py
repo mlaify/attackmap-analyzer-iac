@@ -15,6 +15,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, read_source, rel
+
 from .contracts import (
     AnalyzerMetadata,
     AuthHint,
@@ -26,9 +28,9 @@ from .contracts import (
 )
 
 
-_SKIP_DIRS = frozenset(
-    {"node_modules", ".git", ".venv", "venv", "dist", "build", ".turbo", "out", "target"}
-)
+# Every directory this plugin used to skip is in the shared list; matched
+# against directory names *inside* the repo only.
+_SKIP_DIRS = DEFAULT_SKIP_DIRS
 
 
 # ---- Dockerfile patterns -----------------------------------------------------
@@ -133,12 +135,8 @@ class IacAnalyzer:
         repo = Path(repo_path).resolve()
         if not repo.exists() or not repo.is_dir():
             return False
-        for candidate in repo.rglob("*"):
-            if not candidate.is_file():
-                continue
-            if any(part in _SKIP_DIRS for part in candidate.parts):
-                continue
-            if _is_iac_file(candidate):
+        for candidate in _iter_candidates(repo):
+            if _is_iac_file(candidate, rel(candidate, repo)):
                 return True
         return False
 
@@ -148,17 +146,13 @@ class IacAnalyzer:
         if not repo.exists() or not repo.is_dir():
             return result
 
-        for path in repo.rglob("*"):
-            if not path.is_file():
+        for path in _iter_candidates(repo):
+            relative = rel(path, repo)
+            if not _is_iac_file(path, relative):
                 continue
-            if any(part in _SKIP_DIRS for part in path.parts):
-                continue
-            if not _is_iac_file(path):
-                continue
-            content = _read_text(path)
+            content = read_source(path)
             if content is None:
                 continue
-            relative = str(path.relative_to(repo)).replace("\\", "/")
             result.files_scanned += 1
             if path.name in DOCKERFILE_NAMES:
                 _analyze_dockerfile(content, relative, result)
@@ -173,12 +167,22 @@ class IacAnalyzer:
         return result
 
 
-def _is_iac_file(path: Path) -> bool:
+def _iter_candidates(repo: Path):
+    """Files that might be IaC files; ``_is_iac_file`` makes the final call."""
+    return iter_repo_files(
+        repo,
+        names=DOCKERFILE_NAMES | COMPOSE_NAMES | ENV_TEMPLATE_NAMES,
+        suffixes=SHELL_SUFFIXES | {".yml", ".yaml"},
+        skip_dirs=_SKIP_DIRS,
+    )
+
+
+def _is_iac_file(path: Path, relative: str) -> bool:
     if path.name in DOCKERFILE_NAMES:
         return True
     if path.name in COMPOSE_NAMES:
         return True
-    if _GHA_PATH.search(str(path).replace("\\", "/")):
+    if _GHA_PATH.search(relative):
         return True
     if path.name in ENV_TEMPLATE_NAMES:
         return True
@@ -199,13 +203,13 @@ def _analyze_dockerfile(content: str, relative: str, result: ScanResult) -> None
         for match in _DF_USER.finditer(content):
             user = match.group("user").strip("'\"")
             if user.lower() in {"root", "0"}:
-                _append_auth(result, "dockerfile_user_root", relative, line=_line_of(content, match.start()))
+                _append_auth(result, "dockerfile_user_root", relative, line=line_of(content, match.start()))
 
     # EXPOSE — each exposed port is a route-like entry point.
     for match in _DF_EXPOSE.finditer(content):
         ports = re.findall(r"\d+", match.group("ports"))
         for port in ports:
-            _append_route(result, f"container:{port}", "EXPOSE", relative, line=_line_of(content, match.start()))
+            _append_route(result, f"container:{port}", "EXPOSE", relative, line=line_of(content, match.start()))
 
     # HEALTHCHECK absence signals thin operational monitoring.
     if not _DF_HEALTHCHECK.search(content):
@@ -213,12 +217,12 @@ def _analyze_dockerfile(content: str, relative: str, result: ScanResult) -> None
 
     # RUN curl|bash — fetching + executing remote content in the image build.
     for match in _DF_RUN_CURL_PIPE.finditer(content):
-        _append_external(result, "dockerfile:curl-pipe-shell", relative, line=_line_of(content, match.start()))
+        _append_external(result, "dockerfile:curl-pipe-shell", relative, line=line_of(content, match.start()))
         _append_auth(result, "dockerfile_run_curl_pipe", relative)
 
     # ADD https://... — remote fetch during build, no signature check by default.
     for match in _DF_ADD_REMOTE.finditer(content):
-        _append_auth(result, "dockerfile_add_remote", relative, line=_line_of(content, match.start()))
+        _append_auth(result, "dockerfile_add_remote", relative, line=line_of(content, match.start()))
 
     # FROM image tag vs SHA pinning.
     for match in _DF_FROM.finditer(content):
@@ -228,7 +232,7 @@ def _analyze_dockerfile(content: str, relative: str, result: ScanResult) -> None
                 result,
                 "dockerfile_base_image_unpinned",
                 relative,
-                line=_line_of(content, match.start()),
+                line=line_of(content, match.start()),
                 evidence=image,
             )
 
@@ -259,7 +263,7 @@ def _analyze_compose(content: str, relative: str, result: ScanResult) -> None:
                     result,
                     "compose_port_binding_all_interfaces",
                     relative,
-                    line=_line_of(content, line_match.start()),
+                    line=line_of(content, line_match.start()),
                     evidence=binding,
                 )
             _append_route(
@@ -267,7 +271,7 @@ def _analyze_compose(content: str, relative: str, result: ScanResult) -> None:
                 f"container:{container}",
                 "EXPOSE",
                 relative,
-                line=_line_of(content, line_match.start()),
+                line=line_of(content, line_match.start()),
             )
 
     if _COMPOSE_PRIVILEGED.search(content):
@@ -289,7 +293,7 @@ def _analyze_compose(content: str, relative: str, result: ScanResult) -> None:
                 result,
                 "compose_env_file_reference",
                 relative,
-                line=_line_of(content, match.start()),
+                line=line_of(content, match.start()),
                 evidence=env_file,
             )
 
@@ -306,7 +310,7 @@ def _analyze_compose(content: str, relative: str, result: ScanResult) -> None:
             result,
             f"compose_host_mount:{mount.split(':')[0]}",
             relative,
-            line=_line_of(content, line_match.start()),
+            line=line_of(content, line_match.start()),
             evidence=mount,
         )
 
@@ -332,7 +336,7 @@ def _analyze_gha_workflow(content: str, relative: str, result: ScanResult) -> No
                 result,
                 f"gha_third_party_action_tag_pinned:{repo}",
                 relative,
-                line=_line_of(content, match.start()),
+                line=line_of(content, match.start()),
                 evidence=f"{repo}@{ref}",
             )
 
@@ -347,7 +351,7 @@ def _analyze_gha_workflow(content: str, relative: str, result: ScanResult) -> No
             result,
             name=secret_name,
             file=relative,
-            line=_line_of(content, match.start()),
+            line=line_of(content, match.start()),
             kind="env_reference",
         )
 
@@ -363,7 +367,7 @@ def _analyze_env_template(content: str, relative: str, result: ScanResult) -> No
             result,
             name=key,
             file=relative,
-            line=_line_of(content, match.start()),
+            line=line_of(content, match.start()),
             kind="env_template",
         )
 
@@ -374,7 +378,7 @@ def _analyze_shell_installer(content: str, relative: str, result: ScanResult) ->
             result,
             "shell:curl-pipe-shell",
             relative,
-            line=_line_of(content, match.start()),
+            line=line_of(content, match.start()),
         )
         _append_auth(result, "shell_curl_pipe_installer", relative)
 
@@ -386,16 +390,12 @@ def _analyze_shell_installer(content: str, relative: str, result: ScanResult) ->
             result,
             "shell_permissive_chmod",
             relative,
-            line=_line_of(content, match.start()),
+            line=line_of(content, match.start()),
             evidence=match.group(),
         )
 
 
 # ---- Small append helpers with (file, key) dedup ----------------------------
-
-
-def _line_of(content: str, offset: int) -> int:
-    return content.count("\n", 0, offset) + 1
 
 
 def _append_route(
@@ -443,10 +443,3 @@ def _append_secret(
     if any((s.name, s.file, s.line or 0) == key for s in result.secret_hints):
         return
     result.secret_hints.append(SecretHint(name=name, file=file, line=line, kind=kind))
-
-
-def _read_text(path: Path) -> str | None:
-    try:
-        return path.read_text(encoding="utf-8")
-    except (UnicodeDecodeError, OSError):
-        return None
