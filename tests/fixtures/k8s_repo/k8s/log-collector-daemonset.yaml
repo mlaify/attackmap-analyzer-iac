@@ -1,0 +1,30 @@
+# Hardened twin: reads node logs read-only, no runtime socket or host root.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: log-collector
+spec:
+  selector:
+    matchLabels:
+      app: log-collector
+  template:
+    metadata:
+      labels:
+        app: log-collector
+    spec:
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: collector
+          image: example/collector:2.1.0@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: logs
+              mountPath: /var/log
+              readOnly: true
+      volumes:
+        - name: logs
+          hostPath:
+            path: /var/log

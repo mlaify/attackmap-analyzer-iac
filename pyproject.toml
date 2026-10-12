@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "attackmap-analyzer-iac"
 version = "0.1.0"
-description = "Infrastructure-as-Code analyzer plugin for AttackMap (Dockerfile, docker-compose, GitHub Actions, .env templates, shell installers)"
+description = "Infrastructure-as-Code analyzer plugin for AttackMap (Dockerfile, docker-compose, Kubernetes, Helm, GitHub Actions, .env templates, shell installers)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
@@ -27,6 +27,8 @@ keywords = [
   "docker",
   "docker-compose",
   "github-actions",
+  "kubernetes",
+  "helm",
 ]
 classifiers = [
   "Development Status :: 4 - Beta",
@@ -46,6 +48,7 @@ classifiers = [
 ]
 dependencies = [
   "pydantic>=2.7.0",
+  "PyYAML>=6.0",
 ]
 
 [project.optional-dependencies]

@@ -1,0 +1,32 @@
+{{- $fullName := include "agent.fullname" . -}}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ $fullName }}
+  labels:
+    {{- include "agent.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "agent.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "agent.selectorLabels" . | nindent 8 }}
+    spec:
+      hostNetwork: {{ .Values.hostNetwork }}
+      containers:
+        - name: agent
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- if .Values.debug.enabled }}
+        - name: debug
+          image: busybox:1.36.1
+          securityContext:
+            privileged: true
+          {{- end }}
+      volumes:
+        - name: proc
+          hostPath:
+            path: /proc
