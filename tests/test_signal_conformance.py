@@ -17,27 +17,11 @@ from attackmap_analyzer_iac import IacAnalyzer
 FIXTURES = Path(__file__).parent / "fixtures"
 FIXTURE_DIRS = sorted(path for path in FIXTURES.iterdir() if path.is_dir())
 
-# Every AuthHint.hint this analyzer may emit. Anything else is non-auth
-# metadata and belongs in a typed hint list.
-AUTH_HINT_NAMES = frozenset(
-    {
-        # Host-root-equivalent container privileges (#2): same class as
-        # `compose_privileged_container`. A Docker socket mount, SYS_ADMIN/ALL
-        # capabilities, the host PID namespace or disabled seccomp each
-        # decide what the workload may do to the host.
-        "compose_cap_add_sys_admin",
-        "compose_docker_socket_mount",
-        "compose_pid_host",
-        "compose_privileged_container",
-        "compose_seccomp_unconfined",
-        "dockerfile_no_user_directive",
-        "dockerfile_user_root",
-        "gha_no_top_level_permissions",
-        "gha_pull_request_target_with_checkout",
-        "shell_permissive_chmod",
-        "shell_sudo_used",
-    }
-)
+# Every AuthHint.hint this analyzer may emit: none. Container and cluster
+# misconfigurations are CloudMisconfig records (iac#1), and CI / shell posture
+# is framework metadata. An AuthHint next to a Dockerfile EXPOSE route would
+# count as an auth control for it.
+AUTH_HINT_NAMES: frozenset[str] = frozenset()
 AUTH_HINT_PREFIXES: tuple[str, ...] = ()
 
 SIGNAL_LISTS = (
@@ -52,6 +36,7 @@ SIGNAL_LISTS = (
     "framework_hints",
     "secret_hints",
     "dependencies",
+    "cloud_misconfigs",
 )
 
 

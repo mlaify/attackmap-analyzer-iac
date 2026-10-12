@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Kubernetes / Helm checks and misconfiguration records (#1, AttackMap#334)
+
+- **Kubernetes manifests** (`.yaml`/`.yml` with top-level `apiVersion:` and `kind:`) are parsed with PyYAML's composer (line numbers kept), one `---` document at a time. `detect()` now fires on manifest-only repos.
+  - Workloads (Pod, Deployment, StatefulSet, DaemonSet, ReplicaSet, Job, CronJob, ReplicationController): privileged and privilege-escalating containers, `runAsUser: 0`, `hostPath` volumes (tiered: runtime socket, `/`, `/etc`, `/proc`, `/sys`, `/dev`, `/var/lib/kubelet`… high; CA bundles, `/dev/log` and other paths low), `hostPID`/`hostNetwork`/`hostIPC`, dangerous capabilities, `Unconfined` seccomp/AppArmor, `:latest`/untagged images, and one low-confidence `missing_security_context` per workload whose containers lack `runAsNonRoot` or `allowPrivilegeEscalation: false`.
+  - RBAC: `*` verbs/resources on core, RBAC, apps and other control-plane API groups (not on an operator's own CRD group), `escalate`/`bind`/`impersonate`, `create` on `pods/exec`/`pods/attach`, `get`/`list`/`watch` on Secrets; `ClusterRoleBinding`/`RoleBinding` to `cluster-admin` or to `system:authenticated`/`unauthenticated`/`anonymous`.
+  - Services of type `LoadBalancer`/`NodePort` are entrypoints, and without `loadBalancerSourceRanges` an `exposed_service` record (internal load balancers skipped). `Ingress` host/path rules are `Route`s (`ANY`) plus a `k8s_ingress:<host>` entrypoint. Literal `Secret` `data`/`stringData` values with credential-shaped keys are `SecretHint(kind="hardcoded")` (value redacted).
+- **Helm charts** are analyzed without rendering. `{{ }}` actions are stripped with line numbers kept. A templated value is never reported, and a `toYaml`'d block counts as set (no "missing" record). Settings inside `{{ if }}`/`{{ with }}` are reported at confidence 0.4. If the stripped text doesn't parse, the document is re-parsed with directive lines blanked and absence checks are skipped. `values.yaml` next to a `Chart.yaml` is checked for insecure defaults at confidence 0.5.
+- **Dockerfile:** `FROM` with `:latest` or no tag (`unpinned_container_image`). `ADD <url>` now also matches with flags before the URL, and `ADD --checksum=…` is not reported as a misconfiguration.
+- **Compose:** `ipc: host`, `apparmor:unconfined`, and other dangerous `cap_add` values (`SYS_MODULE`, `SYS_PTRACE`, `NET_ADMIN`, …). Bind mounts of `/etc`, `/proc`, `/sys` and similar host paths are reported, and so is every occurrence of each setting, not just the first. Commented-out lines and the container side of a long-syntax mount are skipped. Records name the compose service.
+
+### Changed — misconfigurations are `CloudMisconfig` records, not `AuthHint`s (#1)
+
+- Container misconfigurations are emitted as core's `CloudMisconfig` record (AttackMap#334), which core turns into findings. Before this, `dockerfile_no_user_directive`, `dockerfile_user_root`, `compose_privileged_container`, `compose_docker_socket_mount`, `compose_cap_add_sys_admin`, `compose_pid_host` and `compose_seccomp_unconfined` were `AuthHint`s, which never became findings and counted as auth signals for routes in the same file (a Dockerfile `EXPOSE`). Remote `ADD`, `RUN curl | sh` and `network_mode: host` also get records. Their framework / entrypoint hints are unchanged.
+- `gha_pull_request_target_with_checkout`, `gha_no_top_level_permissions`, `shell_sudo_used` and `shell_permissive_chmod` move from `auth_hints` to `framework_hints` (strings unchanged). The plugin emits no `AuthHint`s.
+- With a core that has no `CloudMisconfig`, the seven container `AuthHint`s above are still emitted, so an old core sees what it saw before.
+- New dependency: `PyYAML>=6.0` (already an AttackMap core dependency).
+
 ### Fixed — Dockerfile / compose misreads (#2)
 
 - **Dockerfile and compose name variants are analyzed.**

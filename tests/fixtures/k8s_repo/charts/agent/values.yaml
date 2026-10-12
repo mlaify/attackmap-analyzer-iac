@@ -1,0 +1,9 @@
+image:
+  repository: example/agent
+  tag: ""
+hostNetwork: true
+securityContext:
+  privileged: false
+  runAsUser: 0
+debug:
+  enabled: false

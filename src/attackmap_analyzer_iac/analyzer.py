@@ -2,8 +2,9 @@
 
 Covers files that drive the runtime posture but aren't application
 source: Dockerfile, docker-compose, GitHub Actions workflows, `.env`
-templates, and shell installers. All extraction is regex-based —
-intentionally shallow and dependency-free (no yaml/toml parser needed).
+templates, shell installers, and Kubernetes manifests / Helm charts. The
+first five are regex-based and intentionally shallow; Kubernetes and Helm
+are parsed with PyYAML (see `k8s.py`).
 
 See the Bluesky FINDINGS §2 for the motivating gap: `bluesky-social/pds`
 was 95% invisible to AttackMap because none of these file types had
@@ -19,7 +20,6 @@ from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, line_snip
 
 from .contracts import (
     AnalyzerMetadata,
-    AuthHint,
     EntrypointHint,
     ExternalCall,
     FrameworkHint,
@@ -28,14 +28,17 @@ from .contracts import (
     SecretHint,
     ServiceHint,
 )
+from .k8s import analyze_manifest, analyze_values, is_chart_template, is_chart_values, looks_like_k8s
+from .records import append_misconfig, capability_severity, host_path_risk
 
-# Where each posture signal goes (AttackMap#258). The SDK has no weakness /
-# posture signal type, so:
-# - privilege and authorization posture (who the workload or CI job runs as,
-#   what it may do) stays an AuthHint;
+# Where each posture signal goes:
+# - container and cluster misconfigurations (root user, privileged, host
+#   mounts and namespaces, capabilities, remote build inputs, RBAC) are
+#   `CloudMisconfig` records (iac#1, see records.py), which core turns into
+#   findings. They were `AuthHint`s, which core reads as auth signals;
 # - network exposure is an EntrypointHint;
-# - build / supply-chain / deployment-config posture is a FrameworkHint.
-# Hint strings are unchanged.
+# - build / supply-chain / deployment-config posture, and CI / shell posture,
+#   is a FrameworkHint (AttackMap#258). No AuthHints are emitted.
 
 
 # Every directory this plugin used to skip is in the shared list; matched
@@ -65,7 +68,9 @@ _DF_RUN_CURL_PIPE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 _DF_COPY_CHOWN = re.compile(r"^\s*COPY\s+--chown=", re.IGNORECASE | re.MULTILINE)
-_DF_ADD_REMOTE = re.compile(r"^\s*ADD\s+https?://", re.IGNORECASE | re.MULTILINE)
+# `ADD [--flag ...] https://...`; `--checksum=` verifies the download.
+_DF_ADD_REMOTE = re.compile(r"^[ \t]*ADD[ \t]+(?P<flags>(?:--\S+[ \t]+)*)https?://\S*", re.IGNORECASE | re.MULTILINE)
+_IMAGE_TAG = re.compile(r":([\w][\w.-]{0,127})$")
 
 
 # ---- docker-compose patterns -------------------------------------------------
@@ -89,6 +94,8 @@ _COMPOSE_PID_HOST = re.compile(r"^\s+pid:\s*['\"]?host['\"]?\s*(?:#.*)?$", re.IG
 _COMPOSE_SECCOMP_UNCONFINED = re.compile(r"seccomp[:=]\s*['\"]?unconfined\b", re.IGNORECASE)
 _COMPOSE_PRIVILEGED = re.compile(r"^\s+privileged:\s*true", re.IGNORECASE | re.MULTILINE)
 _COMPOSE_NETWORK_HOST = re.compile(r"^\s+network_mode:\s*['\"]?host['\"]?", re.IGNORECASE | re.MULTILINE)
+_COMPOSE_IPC_HOST = re.compile(r"^[ \t]+ipc:[ \t]*['\"]?host['\"]?[ \t]*(?:#.*)?$", re.IGNORECASE | re.MULTILINE)
+_COMPOSE_APPARMOR_UNCONFINED = re.compile(r"apparmor[:=][ \t]*['\"]?unconfined\b", re.IGNORECASE)
 # Matches both `env_file: pds.env` (inline) and the list form:
 #   env_file:
 #     - pds.env
@@ -149,9 +156,9 @@ class IacAnalyzer:
         name="iac",
         display_name="IaC / Deployment-Surface Analyzer",
         version="0.1.0",
-        description="Analyzer for infrastructure-as-code and deployment files: Dockerfile, docker-compose, GitHub Actions, .env templates, shell installers.",
+        description="Analyzer for infrastructure-as-code and deployment files: Dockerfile, docker-compose, Kubernetes manifests, Helm charts, GitHub Actions, .env templates, shell installers.",
         scope="Deployment / operations repositories where the runtime posture is defined outside application source. Closes the coverage gap Bluesky FINDINGS §2 documented for bluesky-social/pds.",
-        targets=["docker", "docker-compose", "github-actions", "env-template", "shell-installer"],
+        targets=["docker", "docker-compose", "kubernetes", "helm", "github-actions", "env-template", "shell-installer"],
         languages=[],
         priority=40,
         experimental=False,
@@ -169,6 +176,10 @@ class IacAnalyzer:
         for candidate in _iter_candidates(repo):
             if _is_iac_file(candidate, rel(candidate, repo)):
                 return True
+            if _is_yaml(candidate):
+                content = read_source(candidate)
+                if content is not None and looks_like_k8s(content):
+                    return True
         return False
 
     def analyze(self, repo_path: str | Path) -> ScanResult:
@@ -179,10 +190,21 @@ class IacAnalyzer:
 
         for path in _iter_candidates(repo):
             relative = rel(path, repo)
-            if not _is_iac_file(path, relative):
+            named = _is_iac_file(path, relative)
+            if not named and not _is_yaml(path):
                 continue
             content = read_source(path)
             if content is None:
+                continue
+            if not named:
+                # Kubernetes manifests, Helm templates and chart values (iac#1).
+                if is_chart_values(path):
+                    analyze_values(content, relative, result)
+                elif looks_like_k8s(content):
+                    analyze_manifest(content, relative, result, chart=is_chart_template(path, repo))
+                else:
+                    continue
+                result.files_scanned += 1
                 continue
             result.files_scanned += 1
             if _is_dockerfile(path.name):
@@ -215,6 +237,10 @@ def _is_dockerfile(name: str) -> bool:
         lower.startswith(("dockerfile", "containerfile"))
         or lower.endswith((".dockerfile", ".containerfile"))
     )
+
+
+def _is_yaml(path: Path) -> bool:
+    return path.suffix.lower() in {".yaml", ".yml"}
 
 
 def _is_compose_file(name: str) -> bool:
@@ -300,22 +326,24 @@ def _analyze_dockerfile(content: str, relative: str, result: ScanResult) -> None
     if effective_user is None:
         # A `:nonroot` / `:nonroot-…` distroless-style base sets its own user.
         if not re.search(r":nonroot\b", final_image):
-            _append_hint(
-                result.auth_hints, AuthHint, "dockerfile_no_user_directive", relative, content, final_stage,
-                evidence=(
-                    "no USER directive in the final stage: the container runs as root"
-                    if len(stages) > 1
-                    else "no USER directive: the container runs as root"
-                ),
-                confidence=0.6,
+            _misconfig(
+                result, "container_runs_as_root", relative, content, final_stage,
+                "no USER directive in the final stage: the container runs as root"
+                if len(stages) > 1
+                else "no USER directive: the container runs as root",
+                severity="low", confidence=0.6, platform="docker",
+                escalation="a compromise of the process is root inside the container",
+                legacy_auth_hint="dockerfile_no_user_directive",
             )
     else:
         match, base = effective_user
         user = match.group("user").strip("'\"").split(":", 1)[0]
         if user.lower() in {"root", "0"}:
-            _append_hint(
-                result.auth_hints, AuthHint, "dockerfile_user_root", relative, content, base + _at(match),
-                confidence=0.9,
+            _misconfig(
+                result, "container_runs_as_root", relative, content, base + _at(match), None,
+                severity="medium", confidence=0.9, platform="docker",
+                escalation="a compromise of the process is root inside the container",
+                legacy_auth_hint="dockerfile_user_root",
             )
 
     # EXPOSE — each exposed port is a route-like entry point.
@@ -343,13 +371,25 @@ def _analyze_dockerfile(content: str, relative: str, result: ScanResult) -> None
             result.framework_hints, FrameworkHint, "dockerfile_run_curl_pipe", relative, content, _at(match),
             confidence=0.9,
         )
+        _misconfig(
+            result, "dockerfile_curl_pipe_shell", relative, content, _at(match), None,
+            severity="medium", confidence=0.9, platform="docker",
+            escalation="whoever controls the URL (or the network path to it) runs code in the image build",
+        )
 
-    # ADD https://... — remote fetch during build, no signature check by default.
+    # ADD https://... — remote fetch during build, no integrity check unless
+    # `--checksum=` is given.
     for match in _DF_ADD_REMOTE.finditer(content):
         _append_hint(
             result.framework_hints, FrameworkHint, "dockerfile_add_remote", relative, content, _at(match),
             confidence=0.9,
         )
+        if "--checksum=" not in match.group("flags").lower():
+            _misconfig(
+                result, "dockerfile_remote_add", relative, content, _at(match), None,
+                severity="medium", confidence=0.9, platform="docker",
+                escalation="whoever controls the URL changes a file baked into the image",
+            )
 
     # FROM image tag vs SHA pinning. `scratch` is not an image and
     # `FROM <earlier-stage-alias>` refers to a stage in this file. One hint
@@ -362,6 +402,15 @@ def _analyze_dockerfile(content: str, relative: str, result: ScanResult) -> None
                 result.framework_hints, FrameworkHint, f"dockerfile_base_image_unpinned:{image}", relative, content,
                 stage["offset"], evidence=image, confidence=0.8,
             )
+            # `:latest`, or no tag at all (which means latest). Build-arg
+            # images (`FROM ${BASE}`) are not judged.
+            tag = _IMAGE_TAG.search(image.rsplit("/", 1)[-1])
+            if "$" not in image and (tag is None or tag.group(1).lower() == "latest"):
+                _misconfig(
+                    result, "unpinned_container_image", relative, content, stage["offset"], f"FROM {image}",
+                    severity="low", confidence=0.8, platform="docker",
+                    escalation="whoever can push the tag changes the base of every rebuild",
+                )
         if stage["alias"]:
             aliases.add(stage["alias"])
 
@@ -451,42 +500,54 @@ def _analyze_compose(content: str, relative: str, result: ScanResult) -> None:
 
     # Host-root-equivalent settings: Docker socket mounts, SYS_ADMIN/ALL
     # capabilities, the host PID namespace, seccomp disabled.
-    sock = _COMPOSE_DOCKER_SOCKET.search(content)
-    if sock:
-        _append_hint(
-            result.auth_hints, AuthHint, "compose_docker_socket_mount", relative, content, sock.start("sock"),
-            confidence=0.95,
-        )
-    for cap, offset in _compose_cap_add(content):
-        if cap.upper().removeprefix("CAP_") in {"SYS_ADMIN", "ALL"}:
-            _append_hint(
-                result.auth_hints, AuthHint, "compose_cap_add_sys_admin", relative, content, offset,
-                confidence=0.9,
-            )
-    pid_host = _COMPOSE_PID_HOST.search(content)
-    if pid_host:
-        _append_hint(
-            result.auth_hints, AuthHint, "compose_pid_host", relative, content, _at(pid_host), confidence=0.9,
-        )
-    seccomp = _COMPOSE_SECCOMP_UNCONFINED.search(content)
-    if seccomp:
-        _append_hint(
-            result.auth_hints, AuthHint, "compose_seccomp_unconfined", relative, content, seccomp.start(),
-            confidence=0.9,
+    services = _compose_services(content)
+
+    def record(kind: str, offset: int, severity: str, escalation: str, legacy: str | None = None) -> None:
+        line_start = content.rfind("\n", 0, offset) + 1
+        if "#" in content[line_start:offset]:
+            return  # commented out
+        _misconfig(
+            result, kind, relative, content, offset, None, severity=severity, confidence=0.9, platform="compose",
+            resource=_service_at(services, offset), escalation=escalation, legacy_auth_hint=legacy,
         )
 
-    privileged = _COMPOSE_PRIVILEGED.search(content)
-    if privileged:
-        _append_hint(
-            result.auth_hints, AuthHint, "compose_privileged_container", relative, content, _at(privileged),
-            confidence=0.9,
-        )
+    for sock in _COMPOSE_DOCKER_SOCKET.finditer(content):
+        line_start = content.rfind("\n", 0, sock.start("sock")) + 1
+        if "target:" in content[line_start:sock.start("sock")]:
+            continue  # long syntax: the container side of the mount
+        record("host_path_mount", sock.start("sock"), "high", host_path_risk(sock.group("sock"))[1],
+               "compose_docker_socket_mount")
+    for cap, offset in _compose_cap_add(content):
+        severity = capability_severity(cap)
+        if severity:
+            name = cap.upper().removeprefix("CAP_")
+            record("dangerous_capability", offset, severity,
+                   f"CAP_{name} → kernel interfaces that allow a container escape" if severity == "high"
+                   else f"CAP_{name} → control of the host's or container's network stack",
+                   "compose_cap_add_sys_admin" if name in {"SYS_ADMIN", "ALL"} else None)
+    for pid_host in _COMPOSE_PID_HOST.finditer(content):
+        record("host_namespace_shared", _at(pid_host), "high",
+               "host PID namespace → see and signal host processes and read their environment", "compose_pid_host")
+    for ipc_host in _COMPOSE_IPC_HOST.finditer(content):
+        record("host_namespace_shared", _at(ipc_host), "medium", "host IPC namespace → read host processes' shared memory")
+    for profile in (*_COMPOSE_SECCOMP_UNCONFINED.finditer(content), *_COMPOSE_APPARMOR_UNCONFINED.finditer(content)):
+        record("security_profile_disabled", profile.start(), "medium",
+               "no syscall/LSM filter: kernel exploits and escape techniques aren't blocked",
+               "compose_seccomp_unconfined" if profile.group().lower().startswith("seccomp") else None)
+
+    for privileged in _COMPOSE_PRIVILEGED.finditer(content):
+        record("privileged_container", _at(privileged), "high",
+               "privileged container → every device and capability of the host → root on the host",
+               "compose_privileged_container")
     network_host = _COMPOSE_NETWORK_HOST.search(content)
     if network_host:
         _append_hint(
             result.entrypoint_hints, EntrypointHint, "compose_network_mode_host", relative, content,
             _at(network_host), confidence=0.9,
         )
+    for network_host in _COMPOSE_NETWORK_HOST.finditer(content):
+        record("host_namespace_shared", _at(network_host), "medium",
+               "host network namespace → reach host-local services and bind any host port")
 
     for match in _COMPOSE_ENV_FILE.finditer(content):
         inline = (match.group("inline") or "").strip()
@@ -516,6 +577,11 @@ def _analyze_compose(content: str, relative: str, result: ScanResult) -> None:
             result.framework_hints, FrameworkHint, f"compose_host_mount:{mount.split(':')[0]}", relative, content,
             _at(line_match), evidence=mount, confidence=0.9,
         )
+        # Sensitive host paths only (the runtime socket is reported above):
+        # bind-mounting /srv/data or /var/log is ordinary self-hosting.
+        severity, escalation = host_path_risk(mount.split(":")[0])
+        if severity == "high" and not _COMPOSE_DOCKER_SOCKET.search(mount):
+            record("host_path_mount", _at(line_match), severity, escalation)
 
 
 def _yaml_block(content: str, key: str):
@@ -621,7 +687,7 @@ def _analyze_gha_workflow(content: str, relative: str, result: ScanResult) -> No
     has_checkout = bool(_GHA_CHECKOUT.search(content))
     if pr_target and has_checkout:
         _append_hint(
-            result.auth_hints, AuthHint, "gha_pull_request_target_with_checkout", relative, content,
+            result.framework_hints, FrameworkHint, "gha_pull_request_target_with_checkout", relative, content,
             _at(pr_target), confidence=0.8,
         )
 
@@ -644,7 +710,7 @@ def _analyze_gha_workflow(content: str, relative: str, result: ScanResult) -> No
     if not _GHA_PERMISSIONS.search(content):
         # Absent block: anchor at the top of the workflow.
         _append_hint(
-            result.auth_hints, AuthHint, "gha_no_top_level_permissions", relative, content, None,
+            result.framework_hints, FrameworkHint, "gha_no_top_level_permissions", relative, content, None,
             evidence="no top-level permissions: block (GITHUB_TOKEN gets the repo default scope)",
             confidence=0.6,
         )
@@ -692,13 +758,13 @@ def _analyze_shell_installer(content: str, relative: str, result: ScanResult) ->
     sudo = _SH_SUDO.search(content)
     if sudo:
         _append_hint(
-            result.auth_hints, AuthHint, "shell_sudo_used", relative, content, _at(sudo),
+            result.framework_hints, FrameworkHint, "shell_sudo_used", relative, content, _at(sudo),
             confidence=0.8,
         )
 
     for match in _SH_CHMOD_777.finditer(content):
         _append_hint(
-            result.auth_hints, AuthHint, "shell_permissive_chmod", relative, content, _at(match),
+            result.framework_hints, FrameworkHint, "shell_permissive_chmod", relative, content, _at(match),
             evidence=match.group(), confidence=0.9,
         )
 
@@ -715,6 +781,56 @@ def _at(match: re.Match) -> int:
     """
     text = match.group()
     return match.start() + (len(text) - len(text.lstrip()))
+
+
+def _misconfig(
+    result: ScanResult,
+    kind: str,
+    file: str,
+    content: str,
+    offset: int | None,
+    evidence: str | None,
+    *,
+    severity: str,
+    confidence: float,
+    platform: str,
+    escalation: str,
+    resource: str | None = None,
+    legacy_auth_hint: str | None = None,
+) -> None:
+    """A `CloudMisconfig` at ``offset`` (``None``: line 1, for something
+    missing from the file); ``evidence`` defaults to the source line."""
+    line = line_of(content, offset) if offset is not None else 1
+    append_misconfig(
+        result, kind, file, line, evidence or line_snippet(content, line) or kind,
+        severity=severity, confidence=confidence, resource=resource, platform=platform,
+        escalation=escalation, legacy_auth_hint=legacy_auth_hint,
+    )
+
+
+def _compose_services(content: str) -> list[tuple[int, str]]:
+    """``(offset, name)`` of each top-level service under ``services:``."""
+    header = _COMPOSE_SERVICES_HEADER.search(content)
+    if header is None:
+        return []
+    found: list[tuple[int, str]] = []
+    top_indent = None
+    for match in _COMPOSE_SERVICE_NAME.finditer(content, header.end()):
+        indent = len(match.group("indent"))
+        if top_indent is None:
+            top_indent = indent
+        if indent == top_indent:
+            found.append((match.start("name"), match.group("name")))
+    return found
+
+
+def _service_at(services: list[tuple[int, str]], offset: int) -> str | None:
+    name = None
+    for start, service in services:
+        if start > offset:
+            break
+        name = service
+    return f"service {name}" if name else None
 
 
 def _append_route(

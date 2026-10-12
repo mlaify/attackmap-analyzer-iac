@@ -1,0 +1,13 @@
+# Hardened twin: a dedicated service account bound to a read-only role.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: dashboard-viewer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: viewer
+subjects:
+  - kind: ServiceAccount
+    name: dashboard
+    namespace: monitoring

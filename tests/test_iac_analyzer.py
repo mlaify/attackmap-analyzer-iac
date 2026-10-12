@@ -21,6 +21,11 @@ def _analyze(fixture_name: str = "pds_like_repo"):
     return IacAnalyzer().analyze(FIXTURES / fixture_name)
 
 
+def _records(scan, file: str | None = None) -> set[tuple[str, str]]:
+    """(kind, file) of every CloudMisconfig record (iac#1)."""
+    return {(m.kind, m.file) for m in scan.cloud_misconfigs if file is None or m.file == file}
+
+
 # ---------------------------------------------------------------------------
 # Contract shape
 # ---------------------------------------------------------------------------
@@ -53,10 +58,11 @@ def test_detect_rejects_repo_without_any_iac_files(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_dockerfile_missing_user_directive_produces_hint() -> None:
+def test_dockerfile_missing_user_directive_is_a_root_record() -> None:
     scan = _analyze()
-    hints = {h.hint for h in scan.auth_hints}
-    assert "dockerfile_no_user_directive" in hints
+    record = next(m for m in scan.cloud_misconfigs if (m.kind, m.file) == ("container_runs_as_root", "Dockerfile"))
+    assert (record.severity, record.platform) == ("low", "docker")
+    assert "no USER directive" in (record.evidence_text or "")
 
 
 def test_dockerfile_missing_healthcheck_produces_hint() -> None:
@@ -125,10 +131,11 @@ def test_compose_binds_all_interfaces_produces_hint() -> None:
     assert "compose_port_binding_all_interfaces:80:80" in hints  # caddy: no IP = all interfaces
 
 
-def test_compose_privileged_container_produces_hint() -> None:
+def test_compose_privileged_container_is_a_record() -> None:
     scan = _analyze()
-    hints = {h.hint for h in scan.auth_hints}
-    assert "compose_privileged_container" in hints
+    record = next(m for m in scan.cloud_misconfigs if m.kind == "privileged_container")
+    assert (record.file, record.severity, record.platform) == ("compose.yaml", "high", "compose")
+    assert record.resource and record.resource.startswith("service ")
 
 
 def test_compose_env_file_reference_produces_hint() -> None:
@@ -155,7 +162,7 @@ def test_compose_host_mounted_volumes_produce_hints() -> None:
 
 def test_gha_pull_request_target_with_checkout_produces_hint() -> None:
     scan = _analyze()
-    hints = {h.hint for h in scan.auth_hints}
+    hints = {h.hint for h in scan.framework_hints}
     assert "gha_pull_request_target_with_checkout" in hints
 
 
@@ -182,7 +189,7 @@ def test_gha_first_party_actions_at_tag_do_not_fire_pin_hint() -> None:
 
 def test_gha_no_top_level_permissions_produces_hint() -> None:
     scan = _analyze()
-    hints = {h.hint for h in scan.auth_hints}
+    hints = {h.hint for h in scan.framework_hints}
     assert "gha_no_top_level_permissions" in hints
 
 
@@ -231,13 +238,13 @@ def test_installer_curl_pipe_shell_produces_external_and_hint() -> None:
 
 def test_installer_sudo_produces_hint() -> None:
     scan = _analyze()
-    hints = {h.hint for h in scan.auth_hints}
+    hints = {h.hint for h in scan.framework_hints}
     assert "shell_sudo_used" in hints
 
 
 def test_installer_permissive_chmod_produces_hint() -> None:
     scan = _analyze()
-    hints = [h for h in scan.auth_hints if h.hint == "shell_permissive_chmod"]
+    hints = [h for h in scan.framework_hints if h.hint == "shell_permissive_chmod"]
     assert hints
 
 
@@ -255,7 +262,8 @@ def test_end_to_end_pds_like_scan_surfaces_five_iac_families() -> None:
     # All five signal families should show at least one entry
     assert scan.routes  # container:3000 etc.
     assert scan.external_calls  # curl-pipe
-    assert scan.auth_hints  # privilege posture (root user, sudo, CI token scope)
+    assert not scan.auth_hints  # misconfigurations are records, not auth signals (iac#1)
+    assert scan.cloud_misconfigs  # root user, privileged / socket-mounting containers
     assert scan.framework_hints  # build / supply-chain / deployment-config posture
     assert scan.entrypoint_hints  # network exposure
     assert scan.secret_hints  # env template + workflow secrets
@@ -275,8 +283,8 @@ def test_repo_under_skip_dir_named_parents_is_analyzed(tmp_path: Path) -> None:
     assert analyzer.detect(repo) is True
     result = analyzer.analyze(repo)
     assert result.files_scanned == _analyze().files_scanned
-    assert result.auth_hints
-    assert any(h.file == ".github/workflows/build-and-push-ghcr.yaml" for h in result.auth_hints)
+    assert result.cloud_misconfigs
+    assert any(h.file == ".github/workflows/build-and-push-ghcr.yaml" for h in result.framework_hints)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
@@ -302,15 +310,13 @@ def test_symlinked_file_outside_repo_not_analyzed(tmp_path: Path) -> None:
 
 def test_posture_signals_land_in_typed_lists() -> None:
     scan = _analyze()
-    auth = {h.hint for h in scan.auth_hints}
-    assert auth == {
-        "dockerfile_no_user_directive",
-        "compose_privileged_container",
-        "compose_docker_socket_mount",  # watchtower mounts /var/run/docker.sock (#2)
-        "shell_sudo_used",
-        "shell_permissive_chmod",
-        "gha_pull_request_target_with_checkout",
-        "gha_no_top_level_permissions",
+    assert scan.auth_hints == []
+    assert {m.kind for m in scan.cloud_misconfigs} == {
+        "container_runs_as_root",
+        "privileged_container",
+        "host_path_mount",  # watchtower mounts /var/run/docker.sock (#2)
+        "dockerfile_curl_pipe_shell",
+        "dockerfile_remote_add",
     }
     entrypoints = {h.hint for h in scan.entrypoint_hints}
     assert entrypoints == {
@@ -323,6 +329,8 @@ def test_posture_signals_land_in_typed_lists() -> None:
     assert {"dockerfile_no_healthcheck", "dockerfile_run_curl_pipe", "dockerfile_add_remote"} <= framework
     assert "dockerfile_base_image_unpinned:node:18-alpine" in framework
     assert "shell_curl_pipe_installer" in framework
+    assert {"shell_sudo_used", "shell_permissive_chmod", "gha_pull_request_target_with_checkout",
+            "gha_no_top_level_permissions"} <= framework
 
 
 def test_compose_network_mode_host_is_an_entrypoint_hint(tmp_path: Path) -> None:
@@ -332,14 +340,16 @@ def test_compose_network_mode_host_is_an_entrypoint_hint(tmp_path: Path) -> None
     scan = IacAnalyzer().analyze(tmp_path)
     hint = next(h for h in scan.entrypoint_hints if h.hint == "compose_network_mode_host")
     assert (hint.line, hint.evidence_text) == (4, "network_mode: host")
-    assert not any(h.hint == "compose_network_mode_host" for h in scan.auth_hints)
+    assert not scan.auth_hints
+    record = next(m for m in scan.cloud_misconfigs if m.kind == "host_namespace_shared")
+    assert (record.line, record.resource, record.severity) == (4, "service app", "medium")
 
 
 def test_dockerfile_user_root_cites_the_user_line(tmp_path: Path) -> None:
     (tmp_path / "Dockerfile").write_text("FROM alpine:3\n\nUSER root\nHEALTHCHECK CMD true\n", encoding="utf-8")
     scan = IacAnalyzer().analyze(tmp_path)
-    hint = next(h for h in scan.auth_hints if h.hint == "dockerfile_user_root")
-    assert (hint.line, hint.evidence_text) == (3, "USER root")
+    hint = next(m for m in scan.cloud_misconfigs if m.kind == "container_runs_as_root")
+    assert (hint.line, hint.evidence_text, hint.severity) == (3, "USER root", "medium")
 
 
 def test_directive_lines_skip_preceding_blank_lines() -> None:
@@ -368,9 +378,8 @@ MULTISTAGE = "docker_multistage_repo"
 
 def test_final_stage_without_user_is_root_even_if_builder_sets_user() -> None:
     scan = _analyze(MULTISTAGE)
-    hints = {(h.hint, h.file) for h in scan.auth_hints}
-    assert ("dockerfile_no_user_directive", "Dockerfile") in hints
-    hint = next(h for h in scan.auth_hints if (h.hint, h.file) == ("dockerfile_no_user_directive", "Dockerfile"))
+    assert ("container_runs_as_root", "Dockerfile") in _records(scan)
+    hint = next(m for m in scan.cloud_misconfigs if (m.kind, m.file) == ("container_runs_as_root", "Dockerfile"))
     lines = (FIXTURES / MULTISTAGE / "Dockerfile").read_text().split("\n")
     assert lines[hint.line - 1] == "FROM scratch"  # anchored at the final stage
 
@@ -380,7 +389,7 @@ def test_final_stage_inherits_user_from_its_parent_stage(tmp_path: Path) -> None
         "FROM alpine:3 AS base\nUSER app\nHEALTHCHECK CMD true\n\nFROM base\nCMD [\"run\"]\n", encoding="utf-8"
     )
     scan = IacAnalyzer().analyze(tmp_path)
-    assert not {"dockerfile_no_user_directive", "dockerfile_user_root"} & {h.hint for h in scan.auth_hints}
+    assert ("container_runs_as_root", "Dockerfile") not in _records(scan)
     assert "dockerfile_no_healthcheck" not in {h.hint for h in scan.framework_hints}
 
 
@@ -389,7 +398,7 @@ def test_switching_back_from_root_in_final_stage_is_not_root(tmp_path: Path) -> 
         "FROM alpine:3\nUSER root\nRUN apk add curl\nUSER 10001:10001\n", encoding="utf-8"
     )
     scan = IacAnalyzer().analyze(tmp_path)
-    assert "dockerfile_user_root" not in {h.hint for h in scan.auth_hints}
+    assert ("container_runs_as_root", "Dockerfile") not in _records(scan)
 
 
 @pytest.mark.parametrize(
@@ -434,7 +443,7 @@ def test_env_and_arg_literal_secrets_are_hardcoded_secret_hints() -> None:
 
 def test_dockerfile_variants_and_compose_overrides_are_analyzed() -> None:
     scan = _analyze(MULTISTAGE)
-    files = {h.file for h in [*scan.auth_hints, *scan.entrypoint_hints, *scan.framework_hints, *scan.secret_hints]}
+    files = {h.file for h in [*scan.cloud_misconfigs, *scan.entrypoint_hints, *scan.framework_hints, *scan.secret_hints]}
     assert {"Dockerfile.prod", "api.Dockerfile", "docker-compose.override.yml"} <= files
     assert "Dockerfile.dockerignore" not in files
     assert scan.files_scanned == 5  # Dockerfile, Dockerfile.prod, api.Dockerfile, 2 compose files
@@ -455,7 +464,7 @@ def test_dockerfile_name_variants_are_detected(tmp_path: Path, name: str) -> Non
 def test_compose_name_variants_are_analyzed(tmp_path: Path, name: str) -> None:
     (tmp_path / name).write_text("services:\n  app:\n    privileged: true\n", encoding="utf-8")
     scan = IacAnalyzer().analyze(tmp_path)
-    assert ("compose_privileged_container", name) in {(h.hint, h.file) for h in scan.auth_hints}
+    assert ("privileged_container", name) in _records(scan)
 
 
 def test_composer_yml_is_not_a_compose_file(tmp_path: Path) -> None:
@@ -487,10 +496,12 @@ def test_compose_environment_literal_secrets_are_flagged() -> None:
 
 def test_host_root_equivalent_compose_settings_are_elevated() -> None:
     scan = _analyze(MULTISTAGE)
-    auth = {h.hint for h in scan.auth_hints if h.file == "compose.yaml"}
+    kinds = {m.kind: m for m in scan.cloud_misconfigs if m.file == "compose.yaml"}
     assert {
-        "compose_docker_socket_mount",
-        "compose_cap_add_sys_admin",
-        "compose_pid_host",
-        "compose_seccomp_unconfined",
-    } <= auth
+        "host_path_mount",
+        "dangerous_capability",
+        "host_namespace_shared",
+        "security_profile_disabled",
+    } <= set(kinds)
+    assert kinds["host_path_mount"].severity == "high"
+    assert kinds["dangerous_capability"].severity == "high"
