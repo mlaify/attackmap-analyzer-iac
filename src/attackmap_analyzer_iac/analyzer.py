@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, line_snippet, read_source, rel
+from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, read_source, rel
 
 from .contracts import (
     AnalyzerMetadata,
@@ -29,7 +29,15 @@ from .contracts import (
     ServiceHint,
 )
 from .k8s import analyze_manifest, analyze_values, is_chart_template, is_chart_values, looks_like_k8s
-from .records import append_misconfig, capability_severity, host_path_risk
+from .records import (
+    append_misconfig,
+    capability_severity,
+    first_seen,
+    host_path_risk,
+    line_of,
+    line_snippet,
+    release,
+)
 
 # Where each posture signal goes:
 # - container and cluster misconfigurations (root user, privileged, host
@@ -188,35 +196,38 @@ class IacAnalyzer:
         if not repo.exists() or not repo.is_dir():
             return result
 
-        for path in _iter_candidates(repo):
-            relative = rel(path, repo)
-            named = _is_iac_file(path, relative)
-            if not named and not _is_yaml(path):
-                continue
-            content = read_source(path)
-            if content is None:
-                continue
-            if not named:
-                # Kubernetes manifests, Helm templates and chart values (iac#1).
-                if is_chart_values(path):
-                    analyze_values(content, relative, result)
-                elif looks_like_k8s(content):
-                    analyze_manifest(content, relative, result, chart=is_chart_template(path, repo))
-                else:
+        try:
+            for path in _iter_candidates(repo):
+                relative = rel(path, repo)
+                named = _is_iac_file(path, relative)
+                if not named and not _is_yaml(path):
+                    continue
+                content = read_source(path)
+                if content is None:
+                    continue
+                if not named:
+                    # Kubernetes manifests, Helm templates and chart values (iac#1).
+                    if is_chart_values(path):
+                        analyze_values(content, relative, result)
+                    elif looks_like_k8s(content):
+                        analyze_manifest(content, relative, result, chart=is_chart_template(path, repo))
+                    else:
+                        continue
+                    result.files_scanned += 1
                     continue
                 result.files_scanned += 1
-                continue
-            result.files_scanned += 1
-            if _is_dockerfile(path.name):
-                _analyze_dockerfile(content, relative, result)
-            elif _is_compose_file(path.name):
-                _analyze_compose(content, relative, result)
-            elif _GHA_PATH.search(relative):
-                _analyze_gha_workflow(content, relative, result)
-            elif path.name in ENV_TEMPLATE_NAMES:
-                _analyze_env_template(content, relative, result)
-            elif path.suffix in SHELL_SUFFIXES:
-                _analyze_shell_installer(content, relative, result)
+                if _is_dockerfile(path.name):
+                    _analyze_dockerfile(content, relative, result)
+                elif _is_compose_file(path.name):
+                    _analyze_compose(content, relative, result)
+                elif _GHA_PATH.search(relative):
+                    _analyze_gha_workflow(content, relative, result)
+                elif path.name in ENV_TEMPLATE_NAMES:
+                    _analyze_env_template(content, relative, result)
+                elif path.suffix in SHELL_SUFFIXES:
+                    _analyze_shell_installer(content, relative, result)
+        finally:
+            release(result, result.entrypoint_hints, result.framework_hints, result.service_hints, result.auth_hints)
         return result
 
 
@@ -837,14 +848,14 @@ def _append_route(
     result: ScanResult, path: str, method: str, file: str, line: int | None = None
 ) -> None:
     key = (path, method, file)
-    if any((r.path, r.method, r.file) == key for r in result.routes):
+    if not first_seen(result, ("route", *key)):
         return
     result.routes.append(Route(path=path, method=method, file=file, line=line))
 
 
 def _append_external(result: ScanResult, target: str, file: str, content: str, offset: int) -> None:
     key = (target, file)
-    if any((c.target, c.file) == key for c in result.external_calls):
+    if not first_seen(result, ("external", *key)):
         return
     line = line_of(content, offset)
     result.external_calls.append(
@@ -870,7 +881,7 @@ def _append_hint(
     quoted source line when a more specific value (an image, a mount, an
     ``owner/repo@ref``) identifies the signal better.
     """
-    if any((h.hint, h.file) == (hint, file) for h in bucket):
+    if not first_seen(bucket, (hint, file)):
         return
     line = line_of(content, offset) if offset is not None else 1
     evidence_text = evidence or line_snippet(content, line) or hint
@@ -883,7 +894,7 @@ def _append_secret(
 ) -> None:
     line = line_of(content, offset)
     key = (name, file, line)
-    if any((s.name, s.file, s.line or 0) == key for s in result.secret_hints):
+    if not first_seen(result, ("secret", *key)):
         return
     result.secret_hints.append(
         SecretHint(name=name, file=file, line=line, evidence_text=line_snippet(content, line) or name, kind=kind)

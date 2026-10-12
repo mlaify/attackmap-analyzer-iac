@@ -29,7 +29,15 @@ from pathlib import Path
 import yaml
 
 from .contracts import EntrypointHint, Route, ScanResult, SecretHint
-from .records import append_misconfig, capability_severity, host_path_risk
+from .records import (
+    ADMIN_LIKE_ROLES,
+    append_misconfig,
+    capability_severity,
+    first_seen,
+    host_path_risk,
+    internal_lb,
+    rbac_wildcard,
+)
 
 _TPL = "__TPL__"
 _TEMPLATED_KEY = "__templated__"
@@ -54,6 +62,10 @@ _SECRET_DATA_NON_SECRET_RE = re.compile(r"user|(?:^|[._-])(?:name|host|port|url|
 _SECRET_DATA_STRONG_RE = re.compile(r"passw|secret|token", re.IGNORECASE)
 
 _Loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+# libyaml (and PyYAML's composer) recurse per nesting level; 30000 nested `[`
+# segfaults CSafeLoader. Real manifests nest a few dozen levels.
+_MAX_FLOW_DEPTH = 200
+_MAX_INDENT = 400
 
 _POD_SPEC_PATHS: dict[str, tuple[str, ...]] = {
     "Pod": ("spec",),
@@ -66,13 +78,6 @@ _POD_SPEC_PATHS: dict[str, tuple[str, ...]] = {
     "CronJob": ("spec", "jobTemplate", "spec", "template", "spec"),
 }
 _CONTAINER_LISTS = ("initContainers", "containers", "ephemeralContainers")
-_INTERNAL_LB_MARKERS = ("internal", "private")
-# API groups whose objects are cluster control: a wildcard on a CRD group an
-# operator owns (`monitoring.coreos.com`, `custom.metrics.k8s.io`) is normal.
-_SENSITIVE_API_GROUPS = frozenset({
-    "", "*", "apps", "batch", "extensions", "policy", "networking.k8s.io", "rbac.authorization.k8s.io",
-    "admissionregistration.k8s.io", "certificates.k8s.io", "apiextensions.k8s.io",
-})
 _BROAD_GROUPS = frozenset({"system:authenticated", "system:unauthenticated", "system:anonymous"})
 _NAMESPACES = (
     ("hostPID", "high", "host PID namespace → see and signal node processes and read their environment"),
@@ -109,17 +114,18 @@ def strip_helm(text: str) -> _Stripped:
     line_has_action: set[int] = set()
     conditional: set[int] = set()
     stack: list[bool] = []  # True for if/with frames
+    open_conditionals = [0]  # how many True frames are on the stack (O(1) check)
     pos = 0
     line_no = 0
     while True:
         start = text.find("{{", pos)
         if start == -1:
             chunk = text[pos:]
-            _mark_conditional(conditional, line_no, chunk.count("\n"), stack)
+            _mark_conditional(conditional, line_no, chunk.count("\n"), open_conditionals[0])
             pieces.append(chunk)
             break
         chunk = text[pos:start]
-        _mark_conditional(conditional, line_no, chunk.count("\n"), stack)
+        _mark_conditional(conditional, line_no, chunk.count("\n"), open_conditionals[0])
         line_no += chunk.count("\n")
         pieces.append(chunk)
         end = text.find("}}", start + 2, start + _ACTION_MAX)
@@ -129,10 +135,11 @@ def strip_helm(text: str) -> _Stripped:
         if _CONTROL_RE.match(action):
             if _OPENS_CONDITIONAL_RE.match(action):
                 stack.append(True)
+                open_conditionals[0] += 1
             elif _OPENS_BLOCK_RE.match(action):
                 stack.append(False)
             elif _ENDS_BLOCK_RE.match(action) and stack:
-                stack.pop()
+                open_conditionals[0] -= stack.pop()
             replacement = ""
         else:
             indent = _NINDENT_RE.search(action)
@@ -140,7 +147,7 @@ def strip_helm(text: str) -> _Stripped:
             replacement = _TPL
         newlines = action.count("\n")
         pieces.append(replacement + "\n" * newlines)
-        _mark_conditional(conditional, line_no, newlines, stack)
+        _mark_conditional(conditional, line_no, newlines, open_conditionals[0])
         line_no += newlines
         pos = end
     cleaned = "".join(pieces).split("\n")
@@ -162,8 +169,8 @@ def strip_helm(text: str) -> _Stripped:
     return _Stripped(marked, blanked, conditional, True)
 
 
-def _mark_conditional(conditional: set[int], first_line: int, newlines: int, stack: list[bool]) -> None:
-    if any(stack):
+def _mark_conditional(conditional: set[int], first_line: int, newlines: int, open_conditionals: int) -> None:
+    if open_conditionals:
         conditional.update(range(first_line + 1, first_line + newlines + 2))
 
 
@@ -181,9 +188,32 @@ def _documents(lines: list[str]) -> list[tuple[int, int]]:
     return docs
 
 
+def too_nested(text: str) -> bool:
+    """Cheap pre-check before handing text to libyaml: flow-collection
+    depth (``[``/``{`` outside quotes) or block indentation beyond what any
+    real manifest uses. Linear in the text."""
+    depth = 0
+    quote = ""
+    for ch in text:
+        if quote:
+            if ch == quote or ch == "\n":
+                quote = ""
+        elif ch in "[{":
+            depth += 1
+            if depth > _MAX_FLOW_DEPTH:
+                return True
+        elif ch in "]}":
+            depth = max(depth - 1, 0)
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "\n":
+            pass
+    return any(len(line) - len(line.lstrip(" ")) > _MAX_INDENT for line in text.split("\n"))
+
+
 def _compose(lines: list[str], first: int, end: int):
     text = "\n".join(lines[first:end])
-    if not text.strip():
+    if not text.strip() or too_nested(text):
         return None
     try:
         return yaml.compose(text, Loader=_Loader)
@@ -450,9 +480,8 @@ def _check_role(doc: _Doc, kind: str, resource: str) -> None:
         resources = {(_literal(r) or "").lower() for r in _items(_get(rule, "resources"))}
         summary = f"verbs {sorted(verbs - {''})} on {sorted(resources - {''})}"
         groups_node = _get(rule, "apiGroups")
-        groups = {_literal(g) for g in _items(groups_node)}
-        sensitive = groups_node is None or bool(groups & _SENSITIVE_API_GROUPS)
-        if ("*" in verbs or "*" in resources) and sensitive:
+        groups = None if groups_node is None else {_literal(g) or "" for g in _items(groups_node)}
+        if rbac_wildcard(groups, verbs, resources):
             doc.record("rbac_wildcard", rule, summary, resource=resource, severity="high" if cluster else "medium",
                        confidence=0.9,
                        escalation="every verb or resource, including Secrets and RBAC objects → full control"
@@ -468,7 +497,8 @@ def _check_role(doc: _Doc, kind: str, resource: str) -> None:
             )
             doc.record("rbac_escalation", rule, summary, resource=resource, severity="high", confidence=0.85,
                        escalation=escalation)
-        elif "secrets" in resources and verbs & {"get", "list", "watch"}:
+        elif "secrets" in resources and verbs & {"get", "list", "watch"} and not _items(_get(rule, "resourceNames")):
+            # `resourceNames` narrows it to named Secrets the workload owns.
             doc.record("rbac_secret_access", rule, summary, resource=resource,
                        severity="medium" if cluster else "low", confidence=0.8,
                        escalation="read Secrets → service-account tokens and credentials of every workload in scope")
@@ -485,7 +515,9 @@ def _check_binding(doc: _Doc, resource: str) -> None:
         subjects.append(f"{skind} {sname}")
         if sname in _BROAD_GROUPS:
             broad.append(subject)
-    if role == "cluster-admin" or broad:
+    # The default system:basic-user / system:discovery bindings to
+    # system:authenticated are fine; an admin-like role is not.
+    if role == "cluster-admin" or (broad and role in ADMIN_LIKE_ROLES):
         who = ", ".join(subjects[:4]) or "no subjects"
         node = role_node if role == "cluster-admin" else broad[0]
         doc.record("cluster_admin_binding", node, f"roleRef {role or '?'} → {who}", resource=resource,
@@ -501,13 +533,12 @@ def _check_service(doc: _Doc, name: str, resource: str) -> None:
         return
     annotations = _path(doc.root, ("metadata", "annotations"))
     if isinstance(annotations, yaml.MappingNode):
-        for k, v in annotations.value:
-            text = f"{_scalar(k) or ''}={_scalar(v) or ''}".lower()
-            if any(m in text for m in _INTERNAL_LB_MARKERS) and "load-balancer" in text:
-                return  # internal load balancer
+        pairs = {_scalar(k) or "": _scalar(v) or "" for k, v in annotations.value}
+        if internal_lb(pairs):
+            return  # internal load balancer
     hint = f"k8s_service_{svc_type.lower()}:{name}"
     line = _line(type_node, doc.offset)
-    if not any((h.hint, h.file) == (hint, doc.file) for h in doc.result.entrypoint_hints):
+    if first_seen(doc.result, ("entrypoint", hint, doc.file)):
         doc.result.entrypoint_hints.append(
             EntrypointHint(hint=hint, file=doc.file, line=line, evidence_text=f"type: {svc_type}", confidence=0.8)
         )
@@ -522,7 +553,7 @@ def _check_ingress(doc: _Doc, name: str) -> None:
     for rule in _items(_path(doc.root, ("spec", "rules"))):
         host = _literal(_get(rule, "host")) or "*"
         hint = f"k8s_ingress:{host}"
-        if not any((h.hint, h.file) == (hint, doc.file) for h in doc.result.entrypoint_hints):
+        if first_seen(doc.result, ("entrypoint", hint, doc.file)):
             doc.result.entrypoint_hints.append(
                 EntrypointHint(hint=hint, file=doc.file, line=_line(rule, doc.offset),
                                evidence_text=f"Ingress {name} host {host}", confidence=0.8)
@@ -533,7 +564,7 @@ def _check_ingress(doc: _Doc, name: str) -> None:
             if not path or not path.startswith("/"):
                 continue
             key = (path, "ANY", doc.file)
-            if not any((r.path, r.method, r.file) == key for r in doc.result.routes):
+            if first_seen(doc.result, ("route", *key)):
                 doc.result.routes.append(Route(path=path, method="ANY", file=doc.file,
                                                line=_line(path_node or item, doc.offset)))
 
@@ -554,7 +585,7 @@ def _check_secret(doc: _Doc, name: str) -> None:
                 continue
             line = _line(k, doc.offset)
             secret_name = f"k8s_secret:{name}/{key}"
-            if any((s.name, s.file, s.line) == (secret_name, doc.file, line) for s in doc.result.secret_hints):
+            if not first_seen(doc.result, ("secret", secret_name, doc.file, line)):
                 continue
             doc.result.secret_hints.append(
                 SecretHint(name=secret_name, file=doc.file, line=line, kind="hardcoded",
@@ -576,6 +607,8 @@ _VALUES_FLAGS = {
 def analyze_values(content: str, relative: str, result: ScanResult) -> None:
     """Insecure defaults in a chart's ``values.yaml``. Reported with low
     confidence: a default only matters if a template uses it."""
+    if too_nested(content):
+        return
     try:
         root = yaml.compose(content, Loader=_Loader)
     except Exception:

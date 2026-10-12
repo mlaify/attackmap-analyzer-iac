@@ -308,7 +308,7 @@ def test_compose_records_and_their_negatives(tmp_path: Path) -> None:
 
 
 def test_old_core_gets_the_legacy_auth_hints(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(records, "CloudMisconfig", None)
+    monkeypatch.setattr(records, "CLOUD_RECORDS", False)
     result = _scan(
         tmp_path,
         {
@@ -372,3 +372,146 @@ def test_dockerfile_and_compose_misconfigs_are_core_findings(tmp_path: Path) -> 
     assert findings["container-runs-as-root"].taxonomy and findings["container-runs-as-root"].taxonomy.cwe
     # No AuthHint lands next to the Dockerfile's EXPOSE route as a fake auth control.
     assert not scan.auth_hints
+
+
+# ---------- Hostile input (review round 1) ----------
+
+_RUN_ANALYZER = "import sys; from attackmap_analyzer_iac import IacAnalyzer; IacAnalyzer().analyze(sys.argv[1])"
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        {"deep.yaml": "apiVersion: v1\nkind: Pod\nspec: " + "[" * 30000 + "\n"},
+        {"Chart.yaml": "apiVersion: v2\nname: c\n", "values.yaml": "a: " + "{" * 30000 + "\n"},
+        {"indent.yaml": "apiVersion: v1\nkind: Pod\n" + "".join(" " * i + "a:\n" for i in range(0, 1200, 2))},
+    ],
+    ids=["flow-nesting", "values-nesting", "indent-nesting"],
+)
+def test_deep_nesting_does_not_crash_the_interpreter(tmp_path: Path, files: dict[str, str]) -> None:
+    # libyaml segfaulted (exit -11) on 30000 nested `[`; run in a subprocess
+    # so a crash fails the test instead of killing pytest.
+    import os
+    import subprocess
+    import sys
+
+    for name, text in files.items():
+        (tmp_path / name).write_text(text, encoding="utf-8")
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
+    proc = subprocess.run([sys.executable, "-c", _RUN_ANALYZER, str(tmp_path)], env=env, timeout=120,
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+
+
+def test_too_nested_allows_real_manifests() -> None:
+    from attackmap_analyzer_iac.k8s import too_nested
+
+    assert not too_nested((K8S / "k8s" / "docker-sock-daemonset.yaml").read_text())
+    assert not too_nested("a: '[[[[[['\nb: \"{{{{\"\n")  # brackets inside quotes don't count
+    assert too_nested("x: " + "[" * 201)
+
+
+def test_many_helm_blocks_are_linear(tmp_path: Path) -> None:
+    import time
+
+    (tmp_path / "x.yaml").write_text("apiVersion: v1\nkind: Pod\n" + "{{ range . }}\n" * 80000, encoding="utf-8")
+    start = time.monotonic()
+    IacAnalyzer().analyze(tmp_path)
+    assert time.monotonic() - start < 5  # was ~10 s (quadratic any(stack))
+
+
+def test_many_records_dedup_is_linear(tmp_path: Path) -> None:
+    import time
+
+    compose = "services:\n  a:\n" + "".join(f"    privileged: true\n" for _ in range(20000))
+    (tmp_path / "compose.yaml").write_text(compose, encoding="utf-8")
+    start = time.monotonic()
+    result = IacAnalyzer().analyze(tmp_path)
+    assert time.monotonic() - start < 5
+    assert len(result.cloud_misconfigs) == 20000
+
+
+# ---------- Precision (review round 1) ----------
+
+
+@pytest.mark.parametrize(
+    "rule, expected",
+    [
+        ("  - apiGroups: ['']\n    resources: [events]\n    verbs: ['*']\n", []),
+        ("  - apiGroups: [metrics.k8s.io]\n    resources: ['*']\n    verbs: [get, list]\n", []),
+        ("  - apiGroups: ['']\n    resources: [pods]\n    verbs: ['*']\n", ["rbac_wildcard"]),
+        ("  - apiGroups: ['*']\n    resources: ['*']\n    verbs: [get]\n", ["rbac_wildcard"]),
+        ("  - apiGroups: ['']\n    resources: [secrets]\n    resourceNames: [app-tls]\n    verbs: [get]\n", []),
+        ("  - apiGroups: ['']\n    resources: [secrets]\n    verbs: [get]\n", ["rbac_secret_access"]),
+    ],
+)
+def test_rbac_api_group_resource_and_resource_names_filters(tmp_path: Path, rule: str, expected: list) -> None:
+    text = "apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata:\n  name: r\nrules:\n" + rule
+    assert [m.kind for m in _scan(tmp_path, {"role.yaml": text}).cloud_misconfigs] == expected
+
+
+@pytest.mark.parametrize("role, expected", [("system:basic-user", 0), ("view", 0), ("edit", 1), ("admin", 1)])
+def test_system_authenticated_binding_needs_an_admin_like_role(tmp_path: Path, role: str, expected: int) -> None:
+    text = (
+        "apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRoleBinding\nmetadata:\n  name: b\n"
+        f"roleRef:\n  kind: ClusterRole\n  name: {role}\nsubjects:\n  - kind: Group\n    name: system:authenticated\n"
+    )
+    assert len(_scan(tmp_path, {"b.yaml": text}).cloud_misconfigs) == expected
+
+
+@pytest.mark.parametrize(
+    "annotation, exposed",
+    [
+        ('service.beta.kubernetes.io/aws-load-balancer-internal: "true"', False),
+        ('service.beta.kubernetes.io/aws-load-balancer-internal: "false"', True),
+        ("service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing", True),
+        ("service.beta.kubernetes.io/aws-load-balancer-scheme: internal", False),
+        ("networking.gke.io/load-balancer-type: Internal", False),
+        ('service.beta.kubernetes.io/azure-load-balancer-internal: "{{ .Values.internal }}"', False),
+        ("prometheus.io/scrape: 'true'", True),
+    ],
+)
+def test_internal_load_balancer_annotations(tmp_path: Path, annotation: str, exposed: bool) -> None:
+    text = (
+        f"apiVersion: v1\nkind: Service\nmetadata:\n  name: s\n  annotations:\n    {annotation}\n"
+        "spec:\n  type: LoadBalancer\n"
+    )
+    assert bool(_scan(tmp_path, {"svc.yaml": text}).cloud_misconfigs) is exposed
+
+
+@pytest.mark.parametrize("path", ["/etc/letsencrypt", "/dev/dri"])
+def test_more_benign_host_paths(tmp_path: Path, path: str) -> None:
+    text = (
+        "apiVersion: v1\nkind: Pod\nmetadata:\n  name: p\nspec:\n  containers: []\n"
+        f"  volumes:\n    - name: v\n      hostPath:\n        path: {path}\n"
+    )
+    assert _kinds(_scan(tmp_path, {"pod.yaml": text})) == [("host_path_mount", "low")]
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_cached_line_helpers_match_the_sdk(seed: int) -> None:
+    from attackmap.sdk import line_of as sdk_line_of, line_snippet as sdk_snippet
+
+    from attackmap_analyzer_iac.records import line_of, line_snippet
+
+    rng = random.Random(seed)
+    text = "".join(rng.choice(["a", " ", "\n", "\r\n", "\f", "x" * 300, "\t"]) for _ in range(rng.randint(0, 200)))
+    for offset in range(0, len(text) + 1, max(1, len(text) // 17 or 1)):
+        assert line_of(text, offset) == sdk_line_of(text, offset)
+    for line in range(0, text.count("\n") + 3):
+        assert line_snippet(text, line) == sdk_snippet(text, line)
+
+
+def test_records_and_hints_are_deduplicated() -> None:
+    from attackmap_analyzer_iac.contracts import ScanResult
+
+    result = ScanResult(root=".")
+    for _ in range(3):
+        records.append_misconfig(result, "privileged_container", "a.yaml", 3, "privileged: true", severity="high")
+    records.append_misconfig(result, "privileged_container", "a.yaml", 3, "privileged: true", severity="high",
+                             resource="other")
+    assert len(result.cloud_misconfigs) == 2
+    other = ScanResult(root=".")
+    records.append_misconfig(other, "privileged_container", "a.yaml", 3, "privileged: true", severity="high")
+    assert len(other.cloud_misconfigs) == 1  # keys are per result
+    records.release(result, other)
