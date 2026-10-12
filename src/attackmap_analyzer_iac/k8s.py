@@ -190,8 +190,9 @@ def _documents(lines: list[str]) -> list[tuple[int, int]]:
 
 def too_nested(text: str) -> bool:
     """Cheap pre-check before handing text to libyaml: flow-collection
-    depth (``[``/``{`` outside quotes) or block indentation beyond what any
-    real manifest uses. Linear in the text."""
+    depth (``[``/``{`` outside quotes) or block nesting (indentation plus
+    compact ``- `` / ``? `` / ``: `` indicators at the start of a line)
+    beyond what any real manifest uses. Linear in the text."""
     depth = 0
     quote = ""
     for ch in text:
@@ -208,7 +209,9 @@ def too_nested(text: str) -> bool:
             quote = ch
         elif ch == "\n":
             pass
-    return any(len(line) - len(line.lstrip(" ")) > _MAX_INDENT for line in text.split("\n"))
+    # Block nesting: indentation *and* compact indicators on one line
+    # (`- - - … 1`, `? ? ? … a`) each open a level in libyaml.
+    return any(len(line) - len(line.lstrip(" -?:\t")) > _MAX_INDENT for line in text.split("\n"))
 
 
 def _compose(lines: list[str], first: int, end: int):

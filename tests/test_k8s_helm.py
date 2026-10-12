@@ -385,8 +385,13 @@ _RUN_ANALYZER = "import sys; from attackmap_analyzer_iac import IacAnalyzer; Iac
         {"deep.yaml": "apiVersion: v1\nkind: Pod\nspec: " + "[" * 30000 + "\n"},
         {"Chart.yaml": "apiVersion: v2\nname: c\n", "values.yaml": "a: " + "{" * 30000 + "\n"},
         {"indent.yaml": "apiVersion: v1\nkind: Pod\n" + "".join(" " * i + "a:\n" for i in range(0, 1200, 2))},
+        {"seq.yaml": "apiVersion: v1\nkind: Pod\nx:\n" + "- " * 30000 + "1\n"},
+        {"key.yaml": "apiVersion: v1\nkind: Pod\n" + "? " * 30000 + "a\n"},
+        {"seqflow.yaml": "apiVersion: v1\nkind: Pod\nx:\n" + "- " * 30000 + "{a: 1}\n"},
+        {"Chart.yaml": "apiVersion: v2\nname: c\n", "values.yaml": "x:\n" + "- " * 30000 + "1\n"},
     ],
-    ids=["flow-nesting", "values-nesting", "indent-nesting"],
+    ids=["flow-nesting", "values-nesting", "indent-nesting", "compact-seq", "compact-key", "compact-seq-flow",
+         "values-compact-seq"],
 )
 def test_deep_nesting_does_not_crash_the_interpreter(tmp_path: Path, files: dict[str, str]) -> None:
     # libyaml segfaulted (exit -11) on 30000 nested `[`; run in a subprocess
