@@ -9,6 +9,7 @@ import random
 from pathlib import Path
 
 import pytest
+import yaml
 
 from attackmap_analyzer_iac import IacAnalyzer, records
 from attackmap_analyzer_iac.k8s import strip_helm
@@ -389,13 +390,18 @@ _RUN_ANALYZER = "import sys; from attackmap_analyzer_iac import IacAnalyzer; Iac
         {"key.yaml": "apiVersion: v1\nkind: Pod\n" + "? " * 30000 + "a\n"},
         {"seqflow.yaml": "apiVersion: v1\nkind: Pod\nx:\n" + "- " * 30000 + "{a: 1}\n"},
         {"Chart.yaml": "apiVersion: v2\nname: c\n", "values.yaml": "x:\n" + "- " * 30000 + "1\n"},
+        # Round 3: a quote inside a plain scalar, and a multi-line quoted
+        # string, both fooled the pre-check's quote tracking.
+        {"plainquote.yaml": "apiVersion: v1\nkind: Pod\nmetadata: {name: it's, x: " + "[" * 30000 + "\n"},
+        {"mlquote.yaml": "apiVersion: v1\nkind: Pod\nmetadata:\n  a: 'x\n  y' \n  b: [" + "'q', [" * 15000 + "\n"},
     ],
     ids=["flow-nesting", "values-nesting", "indent-nesting", "compact-seq", "compact-key", "compact-seq-flow",
-         "values-compact-seq"],
+         "values-compact-seq", "plain-scalar-quote", "multiline-quote"],
 )
 def test_deep_nesting_does_not_crash_the_interpreter(tmp_path: Path, files: dict[str, str]) -> None:
-    # libyaml segfaulted (exit -11) on 30000 nested `[`; run in a subprocess
-    # so a crash fails the test instead of killing pytest.
+    # libyaml (CSafeLoader) segfaulted (exit -11) on these; the analyzer now
+    # parses with the pure-Python loader. Run in a subprocess so a crash fails
+    # the test instead of killing pytest.
     import os
     import subprocess
     import sys
@@ -520,3 +526,17 @@ def test_records_and_hints_are_deduplicated() -> None:
     records.append_misconfig(other, "privileged_container", "a.yaml", 3, "privileged: true", severity="high")
     assert len(other.cloud_misconfigs) == 1  # keys are per result
     records.release(result, other)
+
+
+def test_the_c_loader_is_never_used() -> None:
+    from attackmap_analyzer_iac import k8s
+
+    assert k8s._Loader is yaml.SafeLoader
+
+
+def test_parser_recursion_is_caught_even_past_the_pre_check(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from attackmap_analyzer_iac import k8s
+
+    monkeypatch.setattr(k8s, "too_nested", lambda text: False)  # pre-check off: the loader must still be safe
+    (tmp_path / "deep.yaml").write_text("apiVersion: v1\nkind: Pod\nspec: " + "[" * 30000 + "\n", encoding="utf-8")
+    IacAnalyzer().analyze(tmp_path)

@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - YAML nested deeper than 200 flow levels, or indented more than 400 columns, is skipped before it reaches libyaml. 30000 nested `[` used to crash the interpreter (SIGSEGV in CSafeLoader), including through a chart's `values.yaml`.
   - Helm stripping tracks open `{{ if }}`/`{{ with }}` blocks with a counter, so 80000 `{{ range }}` lines take 0.1 s (was 10 s, quadratic).
   - Signal dedup uses key sets, and line numbers and snippets come from a per-file line index (the SDK helpers rescan the file per call). 20000 records in one file are linear.
+- **YAML is parsed with the pure-Python `SafeLoader`, never libyaml.** Shapes that slipped past the nesting pre-check (a quote inside a plain scalar, multi-line quoted strings) still segfaulted CSafeLoader. The Python composer raises a catchable `RecursionError` instead, and the pre-check stays as a fast reject. Cost: helm-charts (626 manifest/values files) 0.6 s → 3.4 s, kubernetes--examples 0.05 s → 0.13 s.
 - **RBAC.**
   - A wildcard is reported only on a control-plane API group *and* for `*` or a sensitive resource. `verbs: ["*"]` on `events` or `metrics.k8s.io` isn't reported.
   - Secret reads narrowed by `resourceNames` aren't reported.

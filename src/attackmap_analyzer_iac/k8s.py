@@ -61,9 +61,13 @@ _SECRET_DATA_KEY_RE = re.compile(r"secret|token|passw|pwd|credential|private|key
 _SECRET_DATA_NON_SECRET_RE = re.compile(r"user|(?:^|[._-])(?:name|host|port|url|endpoint|id)$", re.IGNORECASE)
 _SECRET_DATA_STRONG_RE = re.compile(r"passw|secret|token", re.IGNORECASE)
 
-_Loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
-# libyaml (and PyYAML's composer) recurse per nesting level; 30000 nested `[`
-# segfaults CSafeLoader. Real manifests nest a few dozen levels.
+# The pure-Python loader, never libyaml (CSafeLoader): on hostile nesting the
+# C parser overflows the C stack and kills the interpreter (SIGSEGV), while the
+# Python composer raises a catchable RecursionError. `too_nested` below is
+# only a fast reject; correctness doesn't depend on it.
+_Loader = yaml.SafeLoader
+# PyYAML's composer recurses per nesting level. Real manifests nest a few
+# dozen levels; skip anything far deeper before parsing (a fast reject).
 _MAX_FLOW_DEPTH = 200
 _MAX_INDENT = 400
 
@@ -189,7 +193,7 @@ def _documents(lines: list[str]) -> list[tuple[int, int]]:
 
 
 def too_nested(text: str) -> bool:
-    """Cheap pre-check before handing text to libyaml: flow-collection
+    """Cheap pre-check (a fast reject) before parsing: flow-collection
     depth (``[``/``{`` outside quotes) or block nesting (indentation plus
     compact ``- `` / ``? `` / ``: `` indicators at the start of a line)
     beyond what any real manifest uses. Linear in the text."""
@@ -210,7 +214,7 @@ def too_nested(text: str) -> bool:
         elif ch == "\n":
             pass
     # Block nesting: indentation *and* compact indicators on one line
-    # (`- - - … 1`, `? ? ? … a`) each open a level in libyaml.
+    # (`- - - … 1`, `? ? ? … a`) each open a level in the parser.
     return any(len(line) - len(line.lstrip(" -?:\t")) > _MAX_INDENT for line in text.split("\n"))
 
 
