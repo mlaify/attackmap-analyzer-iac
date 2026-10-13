@@ -514,7 +514,7 @@ def test_cached_line_helpers_match_the_sdk(seed: int) -> None:
 
 
 def test_records_and_hints_are_deduplicated() -> None:
-    from attackmap_analyzer_iac.contracts import ScanResult
+    from attackmap.sdk import ScanResult
 
     result = ScanResult(root=".")
     for _ in range(3):

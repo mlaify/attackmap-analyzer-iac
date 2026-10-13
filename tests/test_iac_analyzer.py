@@ -11,7 +11,7 @@ import pytest
 from attackmap.sdk.contracts import AnalyzerMetadata as SharedAnalyzerMetadata
 from attackmap.sdk.models import ScanResult as SharedScanResult
 from attackmap_analyzer_iac import IacAnalyzer
-from attackmap_analyzer_iac.contracts import AnalyzerMetadata, ScanResult
+from attackmap.sdk import AnalyzerMetadata, ScanResult
 
 
 FIXTURES = Path(__file__).parent / "fixtures"

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 
-from .contracts import AuthHint, CloudMisconfig, ScanResult
+from attackmap.sdk import AuthHint, CloudMisconfig, ScanResult
 
 _EVIDENCE_MAX = 200
 # Feature detection: an older core neither exports the record nor has the field.
