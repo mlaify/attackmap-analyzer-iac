@@ -16,18 +16,21 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, read_source, rel
-
-from .contracts import (
+from attackmap.sdk import (
+    DEFAULT_SKIP_DIRS,
     AnalyzerMetadata,
     EntrypointHint,
     ExternalCall,
     FrameworkHint,
+    iter_repo_files,
+    read_source,
+    rel,
     Route,
     ScanResult,
     SecretHint,
     ServiceHint,
 )
+
 from .k8s import analyze_manifest, analyze_values, is_chart_template, is_chart_values, looks_like_k8s
 from .records import (
     append_misconfig,

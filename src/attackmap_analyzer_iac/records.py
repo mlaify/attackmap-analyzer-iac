@@ -16,7 +16,12 @@ from __future__ import annotations
 
 from bisect import bisect_right
 
-from .contracts import AuthHint, CloudMisconfig, ScanResult
+from attackmap.sdk import AuthHint, ScanResult
+
+try:  # cores before 0.6 don't have the record; then no records are emitted
+    from attackmap.sdk import CloudMisconfig
+except ImportError:  # pragma: no cover - exercised against older cores
+    CloudMisconfig = None  # type: ignore[assignment,misc]
 
 _EVIDENCE_MAX = 200
 # Feature detection: an older core neither exports the record nor has the field.

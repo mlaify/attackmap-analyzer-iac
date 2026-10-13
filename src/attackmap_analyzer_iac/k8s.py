@@ -28,7 +28,12 @@ from pathlib import Path
 
 import yaml
 
-from .contracts import EntrypointHint, Route, ScanResult, SecretHint
+from attackmap.sdk import (
+    EntrypointHint,
+    Route,
+    ScanResult,
+    SecretHint,
+)
 from .records import (
     ADMIN_LIKE_ROLES,
     append_misconfig,
