@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-31
+
+### Changed — packaging
+
+- Released to the mlaify package index (https://pkg.mlaify.io/pypi/simple/). A `v*` tag now builds the wheel and sdist and attaches them to a GitHub release (`.github/workflows/release.yml`); the index picks them up within six hours.
+- The `core` and `dev` extras require `attackmap>=0.6.0` from the index instead of AttackMap's git main.
+
 ### Added — Kubernetes / Helm checks and misconfiguration records (#1, AttackMap#334)
 
 - **Kubernetes manifests** (`.yaml`/`.yml` with top-level `apiVersion:` and `kind:`) are parsed with PyYAML's composer (line numbers kept), one `---` document at a time. `detect()` now fires on manifest-only repos.
