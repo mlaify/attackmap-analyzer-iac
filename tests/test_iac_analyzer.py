@@ -39,7 +39,7 @@ def test_contracts_use_shared_sdk_types() -> None:
 def test_metadata_has_expected_fields() -> None:
     m = IacAnalyzer().metadata
     assert m.name == "iac"
-    assert m.version == "0.1.0"
+    assert m.version == "0.2.0"
     assert m.enabled_by_default is True
     assert m.experimental is False
 

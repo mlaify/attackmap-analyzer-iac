@@ -166,7 +166,7 @@ class IacAnalyzer:
     metadata = AnalyzerMetadata(
         name="iac",
         display_name="IaC / Deployment-Surface Analyzer",
-        version="0.1.0",
+        version="0.2.0",
         description="Analyzer for infrastructure-as-code and deployment files: Dockerfile, docker-compose, Kubernetes manifests, Helm charts, GitHub Actions, .env templates, shell installers.",
         scope="Deployment / operations repositories where the runtime posture is defined outside application source. Closes the coverage gap Bluesky FINDINGS §2 documented for bluesky-social/pds.",
         targets=["docker", "docker-compose", "kubernetes", "helm", "github-actions", "env-template", "shell-installer"],
