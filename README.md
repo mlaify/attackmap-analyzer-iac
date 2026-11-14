@@ -58,12 +58,12 @@ Bluesky FINDINGS §2 documented this as the biggest coverage gap: `bluesky-socia
 ## Install
 
 ```bash
-uv tool install attackmap --with attackmap-analyzer-iac \
-  --index mlaify=https://pkg.mlaify.io/pypi/simple/ --index-strategy first-index
+uv tool install attackmap --with attackmap-analyzer-iac    # from PyPI
+# or: pip install attackmap-analyzer-iac    (installs attackmap too)
 # or from source:
 pip install git+https://github.com/mlaify/attackmap-analyzer-iac.git
 # or as part of the bundle
-pip install "attackmap[all] @ git+https://github.com/mlaify/AttackMap.git"
+pip install "attackmap[all]"
 ```
 
 ## Usage
