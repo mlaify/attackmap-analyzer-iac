@@ -17,6 +17,7 @@ import re
 from pathlib import Path
 
 from attackmap.sdk import (
+    plugin_version,
     DEFAULT_SKIP_DIRS,
     AnalyzerMetadata,
     EntrypointHint,
@@ -166,7 +167,8 @@ class IacAnalyzer:
     metadata = AnalyzerMetadata(
         name="iac",
         display_name="IaC / Deployment-Surface Analyzer",
-        version="0.2.1",
+        version=plugin_version("attackmap-analyzer-iac", default="0.2.1"),
+        requires_core=">=0.8,<2",
         description="Analyzer for infrastructure-as-code and deployment files: Dockerfile, docker-compose, Kubernetes manifests, Helm charts, GitHub Actions, .env templates, shell installers.",
         scope="Deployment / operations repositories where the runtime posture is defined outside application source. Closes the coverage gap Bluesky FINDINGS §2 documented for bluesky-social/pds.",
         targets=["docker", "docker-compose", "kubernetes", "helm", "github-actions", "env-template", "shell-installer"],
